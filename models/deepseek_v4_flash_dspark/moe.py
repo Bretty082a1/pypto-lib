@@ -167,9 +167,13 @@ def dispatch(
     # Meta and payload arrivals ride two independent windows: `arrived` and
     # `data_arrived`.
 
-    # Count routes, publish counts, barrier on meta, cumsum -> recv_count_out.
-    # Needs every source's counts but none of the bulk payload.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta", allow_early_resolve=True) as _meta_tid:
+    # Count routes and publish counts. The peer waits are registered separately
+    # so they do not occupy a core while waiting for a remote rank.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_meta_publish",
+        allow_early_resolve=True,
+    ) as _meta_push_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -201,11 +205,21 @@ def dispatch(
             if dst != my_rank:
                 pld.system.notify(target=arrived, peer=dst, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
 
-        # Wait for every source's meta flag.
+    # A deferred waiter must be a registration-only task. It cannot follow the
+    # route counting and publication work in the producer task above.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.wait(signal=arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
+                pld.system.defer_wait(signal=arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
+    # Consume metadata only after both the local publish and every peer arrival
+    # have completed. Keep _meta_tid as the downstream completion anchor.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_meta_finalize",
+        deps=[_meta_push_tid, _meta_wait_tid],
+        allow_early_resolve=True,
+    ) as _meta_tid:
         # Cumsum recv_meta over sources -> per-expert receive count, which sizes
         # the routed-expert tile loop.
         for e in pl.range(N_LOCAL):
