@@ -1640,14 +1640,40 @@ def build_tensor_specs(
     if use_default_long_context:
         start_pos = [0, 0, 0, config.FLASH.max_position_embeddings - config.DECODE_SEQ]
 
-    if start_pos is None:
-        active_batch = MOE_TOKENS // config.DECODE_SEQ
-    elif isinstance(start_pos, int):
-        active_batch = 1
-    elif isinstance(start_pos, (list, tuple)) and start_pos:
-        active_batch = len(start_pos)
-    else:
-        raise ValueError("start_pos must be None, an int, or a non-empty list/tuple")
+    owner_start_positions = None
+    if isinstance(start_pos, (list, tuple)) and start_pos and num_tokens_per_owner is not None:
+        requested_counts = torch.as_tensor(num_tokens_per_owner, dtype=torch.int32).reshape(-1)
+        if requested_counts.numel() == N_RANKS:
+            if (
+                bool((requested_counts < 0).any())
+                or bool((requested_counts % config.DECODE_SEQ != 0).any())
+            ):
+                raise ValueError(
+                    f"num_tokens_per_owner values must be non-negative multiples of "
+                    f"S={config.DECODE_SEQ}: {requested_counts.tolist()}",
+                )
+            requests_per_owner = requested_counts // config.DECODE_SEQ
+            if len(start_pos) == int(requests_per_owner.sum()):
+                active_batch = int(requests_per_owner.max())
+                if active_batch == 0:
+                    raise ValueError("packed per-owner start positions need at least one active request")
+                owner_start_positions = torch.zeros(N_RANKS, active_batch, dtype=torch.int32)
+                offset = 0
+                for rank, request_count in enumerate(requests_per_owner.tolist()):
+                    owner_start_positions[rank, :request_count] = torch.tensor(
+                        start_pos[offset : offset + request_count], dtype=torch.int32,
+                    )
+                    offset += request_count
+
+    if owner_start_positions is None:
+        if start_pos is None:
+            active_batch = MOE_TOKENS // config.DECODE_SEQ
+        elif isinstance(start_pos, int):
+            active_batch = 1
+        elif isinstance(start_pos, (list, tuple)) and start_pos:
+            active_batch = len(start_pos)
+        else:
+            raise ValueError("start_pos must be None, an int, or a non-empty list/tuple")
     local_t = active_batch * config.DECODE_SEQ
     owner_token_counts = build_num_tokens_per_owner_host(num_tokens_per_owner, local_t)
 
@@ -1658,6 +1684,62 @@ def build_tensor_specs(
         attention_start_pos = list(start_pos) + [0] * ((TP_SIZE - 1) * active_batch)
 
     def attention_specs(module):
+        if owner_start_positions is not None:
+            group_sources = []
+            for group_base in range(0, N_RANKS, TP_SIZE):
+                group_starts = (
+                    owner_start_positions[group_base : group_base + TP_SIZE]
+                    .reshape(-1)
+                    .tolist()
+                )
+                group_sources.append({
+                    source.name: source
+                    for source in module.build_distributed_tensor_specs(local_t, start_pos=group_starts)
+                    if isinstance(source, TensorSpec)
+                })
+            source_names = set(group_sources[0])
+            if any(set(sources) != source_names for sources in group_sources[1:]):
+                raise ValueError(f"{module.__name__} distributed specs differ across DP groups")
+            merged_shapes = {}
+            for name, source in group_sources[0].items():
+                expected = (source.dtype, len(source.shape))
+                if any(
+                    (sources[name].dtype, len(sources[name].shape)) != expected
+                    for sources in group_sources[1:]
+                ):
+                    raise ValueError(f"{module.__name__} spec {name!r} differs across DP groups")
+                shapes = [list(sources[name].shape) for sources in group_sources]
+                if any(shape[0] != TP_SIZE for shape in shapes):
+                    raise ValueError(f"{module.__name__} spec {name!r} lacks its TP rank axis")
+                merged_shapes[name] = [
+                    max(shape[axis] for shape in shapes)
+                    for axis in range(1, len(shapes[0]))
+                ]
+
+            specs = {}
+            for name, source in group_sources[0].items():
+                trailing_shape = merged_shapes[name]
+
+                def init_value(name=name, group_sources=group_sources, trailing_shape=trailing_shape):
+                    result = None
+                    for group, sources in enumerate(group_sources):
+                        value = sources[name].create_tensor()
+                        if result is None:
+                            result = value.new_zeros([N_RANKS, *trailing_shape])
+                        slices = (slice(group * TP_SIZE, (group + 1) * TP_SIZE),) + tuple(
+                            slice(0, extent) for extent in value.shape[1:]
+                        )
+                        result[slices] = value
+                    return result.contiguous()
+
+                spec = TensorSpec(
+                    name, [N_RANKS, *trailing_shape], source.dtype,
+                    init_value=init_value,
+                )
+                spec.resident = source.resident
+                specs[name] = spec
+            return specs
+
         specs = {}
         for source in module.build_distributed_tensor_specs(local_t, start_pos=attention_start_pos):
             if not isinstance(source, TensorSpec):
@@ -1974,6 +2056,30 @@ def dspark_target_hidden_compare(actual, _expected, **kwargs):
     return True, ""
 
 
+def sampled_ids_compare(actual, _expected, **kwargs):
+    """Validate greedy ids against device logits and the inactive-row contract."""
+    import torch
+
+    inputs = kwargs.get("inputs", {})
+    outputs = kwargs.get("actual_outputs", {})
+    row_indices = inputs.get("logit_row_indices")
+    logits = outputs.get("logits")
+    if row_indices is None or logits is None:
+        return False, "    missing logit_row_indices input or logits output"
+
+    expected = torch.full_like(actual, -1)
+    for rank in range(actual.shape[0]):
+        for row in range(MAX_LOGIT_ROWS):
+            if int(row_indices[rank, row]) < 0:
+                continue
+            expected[rank, row].zero_()
+            expected[rank, row, 0] = torch.argmax(logits[rank, row])
+    if not torch.equal(actual, expected):
+        mismatch = (actual != expected).nonzero()[0].tolist()
+        return False, f"    sampled_ids mismatch at index {mismatch}"
+    return True, ""
+
+
 def compare_functions():
     """Validate every output for completion and the DSpark tap mathematically."""
     finite_names = {
@@ -1981,10 +2087,11 @@ def compare_functions():
         "csa_compress_state", "csa_inner_compress_state", "csa_cmp_kv", "csa_idx_kv_cache", "csa_idx_kv_scale",
         "hca_compress_state", "hca_cmp_kv",
         "hidden_workspace", "x_ping", "x_pong", "x_attn_active", "x_moe_next",
-        "pre_hc_hidden_out", "x_out", "logits", "sampled_ids",
+        "pre_hc_hidden_out", "x_out", "logits",
     }
     compare = {name: finite_tensor_compare for name in finite_names}
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
+    compare["sampled_ids"] = sampled_ids_compare
     return compare
 
 
@@ -2004,7 +2111,10 @@ def main():
     )
     parser.add_argument(
         "--start-pos", type=str, default=None,
-        help="a scalar selects batch=1; a comma-separated list sets the batch",
+        help=(
+            "a scalar selects batch=1; a comma-separated list sets the batch; "
+            "with per-owner token counts, a compact list maps active requests in rank order"
+        ),
     )
     parser.add_argument(
         "--num-tokens-per-owner", type=str, default=None,
