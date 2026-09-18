@@ -1,0 +1,190 @@
+{
+  "platform": "a2a3",
+  "sampling": {
+    "rounds": 100,
+    "warmup": 500
+  },
+  "cases": [
+    {
+      "case_id": "mtp-csa-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "mtp-hca-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "mtp-swa-8k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "8192"
+      ]
+    },
+    {
+      "case_id": "mtp-moe-ep16",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_moe.py",
+      "device_count": 16,
+      "arguments": [
+        "--ep",
+        "16",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "8",
+        "--experts-per-rank",
+        "16",
+        "--balanced-routing"
+      ]
+    },
+    {
+      "case_id": "mtp-lm-head-tp4",
+      "entrypoint": "models/deepseek_v4_flash_mtp/lm_head.py",
+      "device_count": 4,
+      "arguments": [
+        "--tp",
+        "4",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "8",
+        "--entry",
+        "projection"
+      ]
+    },
+    {
+      "case_id": "mtp-csa-128k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ]
+    },
+    {
+      "case_id": "mtp-hca-128k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ]
+    },
+    {
+      "case_id": "mtp-swa-128k",
+      "entrypoint": "models/deepseek_v4_flash_mtp/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--start-pos",
+        "131072"
+      ]
+    },
+    {
+      "case_id": "dspark-csa-8k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dspark-hca-8k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dspark-swa-8k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
+      ]
+    },
+    {
+      "case_id": "dspark-moe-ep16",
+      "entrypoint": "models/deepseek_v4_flash_dspark/moe.py",
+      "device_count": 16,
+      "arguments": [
+        "--ep",
+        "16",
+        "--layer-id",
+        "0",
+        "--num-tokens",
+        "128",
+        "--routing",
+        "balanced"
+      ]
+    },
+    {
+      "case_id": "dspark-lm-head-tp4",
+      "entrypoint": "models/deepseek_v4_flash_dspark/lm_head.py",
+      "device_count": 4,
+      "arguments": [
+        "--tp",
+        "4",
+        "--dp",
+        "1",
+        "--num-tokens",
+        "128",
+        "--entry",
+        "projection"
+      ]
+    },
+    {
+      "case_id": "dspark-csa-128k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_csa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dspark-hca-128k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_hca.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    },
+    {
+      "case_id": "dspark-swa-128k",
+      "entrypoint": "models/deepseek_v4_flash_dspark/decode_swa.py",
+      "device_count": 1,
+      "arguments": [
+        "--tp",
+        "1",
+        "--start-pos",
+        "131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072,131072"
+      ]
+    }
+  ]
+}
