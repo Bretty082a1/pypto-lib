@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Torch references for the checkpoint and persistent-cache MX formats."""
 
+import math
+
 import torch
 
 from models.deepseek_v4_1_flash.config import MX_GROUP
@@ -97,6 +99,48 @@ def quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     normalized = (grouped / scale.unsqueeze(-1)).clamp(-6.0, 6.0)
     payload = _pack_fp4(_nearest_fp4_indices(normalized).flatten(-2))
     return payload, encode_e8m0(scale)
+
+
+def prepare_routed_weight_for_device(
+    packed_weight_fp4: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert checkpoint routed FP4 weights into the A5 NPU MXFP8 RHS ABI.
+
+    The input comes from a packed MXFP4 checkpoint with logical shape
+    ``[..., out, in]``, while ``pl.matmul_mx`` requires an ``[..., in, out]`` RHS.
+
+    The PyPTO high-level API does not support ``FP8 activation x FP4 RHS``, so the
+    FP4 decode, logical transpose, MX_B_NN scale reordering and FP8 quantisation
+    all happen at checkpoint/weight-load time. This only prepares persistent device
+    weights on the host; it is not a production kernel path that expands the full
+    weight to FP32.
+
+    Returns:
+        ``device_weight``: ``[..., in, out]`` FP8E4M3FN weights;
+        ``device_scale``: ``[..., in/32, out]`` E8M0 scales in MX_B_NN physical order.
+    """
+    logical_out_in = dequantize_mxfp4(packed_weight_fp4, scale_e8m0)
+    if logical_out_in.shape[-1] % MX_GROUP:
+        raise ValueError("routed FP4 input dimension must be divisible by MX group size")
+
+    logical_in_out = logical_out_in.transpose(-2, -1).contiguous()
+    k_dim, n_dim = logical_in_out.shape[-2:]
+    if k_dim % MX_GROUP or n_dim % 16:
+        raise ValueError("MX_B_NN requires K divisible by 32 and N divisible by 16")
+
+    grouped = logical_in_out.float().reshape(*logical_in_out.shape[:-2], k_dim // MX_GROUP, MX_GROUP, n_dim)
+    amax = grouped.abs().amax(dim=-2)
+    exponent = torch.ceil(torch.log2((amax / 448.0).clamp_min(2.0 ** -127))).clamp(-127, 128)
+    scale_value = torch.exp2(exponent)
+    quantized = (grouped / scale_value.unsqueeze(-2)).clamp(-448.0, 448.0)
+    quantized = quantized.to(torch.float8_e4m3fn).reshape(*logical_in_out.shape[:-2], k_dim, n_dim)
+    scale_codes = encode_e8m0(scale_value)
+    packed_scale = pack_mx_b_scale(scale_codes)
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0 is not None:
+        packed_scale = packed_scale.contiguous().view(e8m0)
+    return quantized, packed_scale
 
 
 def quantize_mxfp8_cache(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -195,3 +239,96 @@ def mxfp8_linear(
     partials = torch.einsum("...gk,gkn->...gn", activation.float(), weight_groups)
     partials = partials * activation_scale.unsqueeze(-1) * weight_scale
     return partials.sum(dim=-2).to(x.dtype)
+
+
+# E8M0 has no native dtype in some PyTorch versions, so it is always carried as uint8.
+FP8_E4M3_MAX = 448.0
+
+def _e8m0_codes_from_amax(amax: torch.Tensor, fp_max: float = FP8_E4M3_MAX) -> torch.Tensor:
+    """Ascend OCP shared-exponent E8M0 codes for each group maximum.
+
+    ``pl.quant_mx`` implements the OCP MX shared exponent
+    ``X = 2 ** (floor(log2(amax)) - emax)``, i.e. it rounds the amax exponent down
+    (``emax = floor(log2(448)) = 8``). Whenever the log2 fraction of amax lands in
+    ``[log2(448/256), 1)`` - about 19.3% of groups - the payload ``amax / X`` falls
+    in ``(448, 512)`` and saturates at the E4M3FN maximum of 448.
+
+    Rounding up with ``ceil(log2(amax / 448))``, as this helper did before, made the
+    golden scale twice the device value and the payload half the size for those same
+    ~19.3% of groups, which showed up as a systematic 1%-5% relative error on the w2
+    output (measured match rate 19.35% vs the theoretical 19.26%). The rounding
+    direction must match the device.
+    """
+    format_emax = int(math.floor(math.log2(fp_max)))
+    _, exponent = torch.frexp(amax.float())
+    codes = exponent.to(torch.int32) - 1 - format_emax + 127
+    codes = codes.clamp(0, 255)
+    return torch.where(amax == 0, torch.zeros_like(codes), codes).to(torch.uint8)
+
+
+def _e8m0_to_fp32(codes: torch.Tensor) -> torch.Tensor:
+    return torch.exp2(codes.to(torch.float32) - 127.0)
+
+
+def pack_mx_a_scale(scale: torch.Tensor) -> torch.Tensor:
+    m, groups = scale.shape
+    if m % 16 or groups % 2:
+        raise ValueError("MX_A_ZZ requires rows%16==0 and groups%2==0")
+    return scale.reshape(m // 16, 16, groups // 2, 2).permute(0, 2, 1, 3).contiguous().reshape(m, groups)
+
+
+def unpack_mx_a_scale(scale: torch.Tensor) -> torch.Tensor:
+    m, groups = scale.shape
+    return scale.reshape(m // 16, groups // 2, 16, 2).permute(0, 2, 1, 3).contiguous().reshape(m, groups)
+
+
+def host_quant_mxfp8_v41(x: torch.Tensor, *, return_e8m0: bool = False):
+    value = x.float()
+    groups = value.reshape(*value.shape[:-1], -1, MX_GROUP)
+    amax = groups.abs().amax(dim=-1)
+    codes = _e8m0_codes_from_amax(amax)
+    scale = _e8m0_to_fp32(codes)
+    payload = (groups / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).reshape_as(value)
+    if not return_e8m0:
+        return payload, scale
+    return payload, codes.to(torch.uint8)
+
+
+def gen_mxfp8_weight_kn_v41(out: int, inn: int, dequant_std: float, *, chan_cv: float = 0.5, seed: int = 0):
+    """Generate MXFP8 weights in the device K-N layout with packed E8M0 scales."""
+    g = torch.Generator().manual_seed(seed)
+    raw = torch.randn(out, inn, generator=g) * torch.exp(chan_cv * torch.randn(out, 1, generator=g))
+    groups = raw.reshape(out, inn // MX_GROUP, MX_GROUP)
+    codes = _e8m0_codes_from_amax(groups.abs().amax(-1))
+    scale = _e8m0_to_fp32(codes)
+    quantized = (groups / scale.unsqueeze(-1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    data_kn = quantized.reshape(out, inn).transpose(0, 1).contiguous()
+    codes_kn = codes.transpose(0, 1).contiguous()
+    decoded = data_kn.float() * _e8m0_to_fp32(codes_kn).repeat_interleave(MX_GROUP, dim=0)
+    gain = dequant_std / decoded.float().std().clamp_min(1e-8)
+    shift = int(torch.round(torch.log2(gain)).item())
+    codes_kn = (codes_kn.to(torch.int32) + shift).clamp(0, 255).to(torch.uint8)
+    scale_e8m0 = pack_mx_b_scale(codes_kn).contiguous()
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0 is not None:
+        scale_e8m0 = scale_e8m0.view(e8m0)
+    return data_kn, scale_e8m0
+
+
+def decode_e8m0_codes_v41(scale: torch.Tensor, *, side: str = "a") -> torch.Tensor:
+    """Recover logical E8M0 codes from an A-ZZ/B-NN physical scale backing."""
+    codes = scale.contiguous().view(torch.uint8)
+    if side == "a":
+        return unpack_mx_a_scale(codes)
+    if side == "b":
+        return unpack_mx_b_scale(codes)
+    raise ValueError(f"side must be 'a' or 'b', got {side!r}")
+
+
+def matmul_mx_golden_v41(a, a_scale, b, b_scale):
+    """Evaluate the FP32 MX matmul golden using logical E8M0 scales."""
+    a_codes = a_scale.contiguous().view(torch.uint8)
+    b_codes = b_scale.contiguous().view(torch.uint8)
+    a_f = a.float() * _e8m0_to_fp32(a_codes).repeat_interleave(MX_GROUP, -1)
+    b_f = b.float() * _e8m0_to_fp32(b_codes).repeat_interleave(MX_GROUP, -2)
+    return torch.matmul(a_f.to(torch.float32), b_f.to(torch.float32))
