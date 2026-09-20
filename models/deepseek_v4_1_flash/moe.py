@@ -39,7 +39,13 @@ SKIP_TRANSPORT_TEST = "--skip-transport" in __import__("sys").argv
 
 from models.deepseek_v4_1_flash.gate import gate as npu_gate
 from models.deepseek_v4_1_flash.expert_shared import expert_shared
-from models.deepseek_v4_1_flash.expert_routed import expert_routed
+from models.deepseek_v4_1_flash.expert_routed import (
+    MX_PACKED_LANE_COLS,
+    MX_W1_PACKED_ROWS,
+    MX_W2_PACKED_ROWS,
+    MX_W3_PACKED_ROWS,
+    expert_routed,
+)
 from models.deepseek_v4_1_flash.ep_transport import dispatch, combine
 from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
 from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
@@ -47,47 +53,11 @@ from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
 
 
 def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
-    """Generate routed fixture weights at the requested decoded magnitude."""
-    from models.deepseek_v4_1_flash.quantization import (
-        pack_mx_b_scale,
-        prepare_routed_weight_for_device,
-        quantize_mxfp4_weight,
-        unpack_mx_b_scale,
+    """Generate the packed FP4 device ABI used by the routed kernel."""
+    from models.deepseek_v4_1_flash.expert_routed import (
+        gen_routed_mxfp4_weights,
     )
-    w1_list, w1s_list = [], []
-    w3_list, w3s_list = [], []
-    w2_list, w2s_list = [], []
-    for expert in range(n_experts):
-        torch.manual_seed(seed_base + expert * 3)
-        w1_packed, w1_scale = quantize_mxfp4_weight(
-            torch.randn(C.MOE_INTER, D) * float(dequant_std["w1"])
-        )
-        w3_packed, w3_scale = quantize_mxfp4_weight(
-            torch.randn(C.MOE_INTER, D) * float(dequant_std["w3"])
-        )
-        w2_packed, w2_scale = quantize_mxfp4_weight(
-            torch.randn(D, C.MOE_INTER) * float(dequant_std["w2"])
-        )
-        w1, w1s = prepare_routed_weight_for_device(w1_packed, w1_scale)
-        w3, w3s = prepare_routed_weight_for_device(w3_packed, w3_scale)
-        w2, w2s = prepare_routed_weight_for_device(w2_packed, w2_scale)
-        w1_list.append(w1)
-        w1s_list.append(w1s)
-        w3_list.append(w3)
-        w3s_list.append(w3s)
-        w2_list.append(w2)
-        w2s_list.append(w2s)
-    def pack_expert_scales(scales):
-        logical = torch.stack([
-            unpack_mx_b_scale(scale.contiguous().view(torch.uint8))
-            for scale in scales
-        ]).flatten(0, 1)
-        return pack_mx_b_scale(logical).view(torch.float8_e8m0fnu)
-    return (
-        torch.stack(w1_list), pack_expert_scales(w1s_list),
-        torch.stack(w3_list), pack_expert_scales(w3s_list),
-        torch.stack(w2_list), pack_expert_scales(w2s_list),
-    )
+    return gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -96,14 +66,15 @@ def _moe_core(
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
-    # Device ABI: the checkpoint [expert,out,in] FP4 weights are converted offline to
-    # [expert,in,out] FP8.
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    # Device ABI: checkpoint [expert,out,in] FP4 weights stay packed in HBM and
+    # are expanded to the matmul FP8 staging layout through the on-device LUT.
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w2: pl.Tensor[[C.MOE_INTER, D], pl.FP8E4M3FN],
@@ -180,7 +151,7 @@ def _moe_core(
         # dispatch already filled this backing; expert_routed views it as MX_A_ZZ.
         expert_routed(recv_x_local, recv_scale_local_backing, recv_weight_local, recv_count_local,
                       routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-                      routed_w2, routed_w2_scale, routed_y)
+                      routed_w2, routed_w2_scale, mxfp4_pair_lut, routed_y)
         # combine writes the final output directly: a dynamically shaped intermediate
         # would escape its defining scope during PTOAS SSA conversion.
         combine(routed_y, recv_route_local, shared_output, output, recv_meta_local,
@@ -197,24 +168,25 @@ def moe(
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[
         [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
         pl.FP8E8M0,
         pl.MX_B_NN,
     ],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2_scale: pl.Tensor[
         [N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D],
         pl.FP8E8M0,
         pl.MX_B_NN,
     ],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[
         [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
         pl.FP8E8M0,
         pl.MX_B_NN,
     ],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[
         [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
@@ -284,7 +256,7 @@ def moe(
         _moe_core(
             x_mixed, norm_weight, gate_weight, correction_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
-            routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
+            routed_w3, routed_w3_scale, mxfp4_pair_lut, shared_w1, shared_w1_scale,
             shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
             token_owners, recv_meta, recv_x, recv_scale, recv_weights,
             recv_routes, arrived, data_arrived, routed_output,
@@ -305,24 +277,25 @@ def moe_test(
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[
         [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
         pl.FP8E8M0,
         pl.MX_B_NN,
     ],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2_scale: pl.Tensor[
         [N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D],
         pl.FP8E8M0,
         pl.MX_B_NN,
     ],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[
         [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
         pl.FP8E8M0,
         pl.MX_B_NN,
     ],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[
         [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
@@ -369,7 +342,7 @@ def moe_test(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
         routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
-        routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
+        routed_w3, routed_w3_scale, mxfp4_pair_lut, shared_w1, shared_w1_scale,
         shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
         token_owners, next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
@@ -389,26 +362,30 @@ def l3_moe(
     gate_weight: pl.Tensor[[EP_SIZE, C.N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[EP_SIZE, C.N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN
+        [EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
     ],
     routed_w1_scale: pl.Tensor[
         [EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
         pl.FP8E8M0,
     ],
     routed_w2: pl.Tensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN
+        [EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
     ],
     routed_w2_scale: pl.Tensor[
         [EP_SIZE, N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D],
         pl.FP8E8M0,
     ],
     routed_w3: pl.Tensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN
+        [EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        pl.UINT8,
     ],
     routed_w3_scale: pl.Tensor[
         [EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
         pl.FP8E8M0,
     ],
+    mxfp4_pair_lut: pl.Tensor[[EP_SIZE, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[EP_SIZE, D, C.MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[
         [EP_SIZE, D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0
@@ -506,7 +483,7 @@ def l3_moe(
             x_hc[r], pre_mix[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_weight[r], gate_weight[r], correction_bias[r],
             routed_w1[r], routed_w1_scale_r, routed_w2[r], routed_w2_scale_r,
-            routed_w3[r], routed_w3_scale_r, shared_w1[r], shared_w1_scale_r,
+            routed_w3[r], routed_w3_scale_r, mxfp4_pair_lut[r], shared_w1[r], shared_w1_scale_r,
             shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
             token_owners[r], next_pre_mix[r], x_mixed[r], x_next[r],
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
@@ -552,7 +529,10 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     from models.deepseek_v4_1_flash.expert_routed import (
         ROUTED_DEQUANT_STD,
     )
-    from models.deepseek_v4_1_flash.quantization import gen_mxfp8_weight_kn_v41
+    from models.deepseek_v4_1_flash.quantization import (
+        build_mxfp4_pair_lut,
+        gen_mxfp8_weight_kn_v41,
+    )
 
     active = max(0, min(MOE_TOKENS, int(num_tokens)))
     torch.manual_seed(41)
@@ -564,16 +544,16 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     correction_bias = _route_bias().unsqueeze(0).expand(EP_SIZE, -1).contiguous()
     token_owners = _owner_pattern().unsqueeze(0).expand(EP_SIZE, -1).contiguous()
 
-    routed_w1_shape = (EP_SIZE, N_LOCAL_EXPERTS, D, C.MOE_INTER)
+    routed_w1_shape = (EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS)
     routed_w1_scale_shape = (EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER)
-    routed_w2_shape = (EP_SIZE, N_LOCAL_EXPERTS, C.MOE_INTER, D)
+    routed_w2_shape = (EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS)
     routed_w2_scale_shape = (EP_SIZE, N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D)
     routed_w3_shape = routed_w1_shape
     routed_w3_scale_shape = routed_w1_scale_shape
 
-    # Real routed shards at the deployment magnitudes: the checkpoint MXFP4
-    # [expert, out, in] weights go through the same offline conversion the
-    # device ABI expects, and every rank draws its own seed.
+    # Real routed shards at deployment magnitudes: checkpoint MXFP4
+    # [expert, out, in] weights follow the packed device ABI, and every rank
+    # draws its own seed.
     routed_w1_list, routed_w1_scale_list = [], []
     routed_w3_list, routed_w3_scale_list = [], []
     routed_w2_list, routed_w2_scale_list = [], []
@@ -588,6 +568,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         routed_w2_list.append(rw2)
         routed_w2_scale_list.append(rw2_s)
     routed_w1 = torch.stack(routed_w1_list)
+    mxfp4_pair_lut = build_mxfp4_pair_lut().unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
     routed_w1_scale = torch.stack(routed_w1_scale_list)
     routed_w3 = torch.stack(routed_w3_list)
     routed_w3_scale = torch.stack(routed_w3_scale_list)
@@ -612,12 +593,16 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         TensorSpec("norm_weight", [EP_SIZE, D], torch.bfloat16, init_value=lambda: norm_weight),
         TensorSpec("gate_weight", [EP_SIZE, C.N_EXPERTS, D], torch.float32, init_value=lambda: gate_weight),
         TensorSpec("correction_bias", [EP_SIZE, C.N_EXPERTS], torch.float32, init_value=lambda: correction_bias),
-        TensorSpec("routed_w1", list(routed_w1_shape), fp8, init_value=lambda: routed_w1),
+        TensorSpec("routed_w1", list(routed_w1_shape), torch.uint8, init_value=lambda: routed_w1),
         TensorSpec("routed_w1_scale", list(routed_w1_scale_shape), e8m0, init_value=lambda: routed_w1_scale),
-        TensorSpec("routed_w2", list(routed_w2_shape), fp8, init_value=lambda: routed_w2),
+        TensorSpec("routed_w2", list(routed_w2_shape), torch.uint8, init_value=lambda: routed_w2),
         TensorSpec("routed_w2_scale", list(routed_w2_scale_shape), e8m0, init_value=lambda: routed_w2_scale),
-        TensorSpec("routed_w3", list(routed_w3_shape), fp8, init_value=lambda: routed_w3),
+        TensorSpec("routed_w3", list(routed_w3_shape), torch.uint8, init_value=lambda: routed_w3),
         TensorSpec("routed_w3_scale", list(routed_w3_scale_shape), e8m0, init_value=lambda: routed_w3_scale),
+        TensorSpec(
+            "mxfp4_pair_lut", [EP_SIZE, 2, 256], torch.int16,
+            init_value=lambda: mxfp4_pair_lut,
+        ),
         TensorSpec("shared_w1", [EP_SIZE, D, C.MOE_INTER], fp8, init_value=lambda: shared_w1),
         TensorSpec("shared_w1_scale", [EP_SIZE, D // MX_GROUP, C.MOE_INTER], e8m0, init_value=lambda: shared_w1_scale),
         TensorSpec("shared_w2", [EP_SIZE, C.MOE_INTER, D], fp8, init_value=lambda: shared_w2),
@@ -839,12 +824,13 @@ def _golden_moe_core(tensors):
             "recv_mx_scale": pack_mx_a_scale(recv_scale_logical).view(e8m0),
             "recv_weights": recv_weights,
             "recv_expert_count": recv_count,
-            "routed_w1": tensors["routed_w1"][dst],
+            "routed_w1_packed": tensors["routed_w1"][dst],
             "routed_w1_scale": tensors["routed_w1_scale"][dst],
-            "routed_w3": tensors["routed_w3"][dst],
+            "routed_w3_packed": tensors["routed_w3"][dst],
             "routed_w3_scale": tensors["routed_w3_scale"][dst],
-            "routed_w2": tensors["routed_w2"][dst],
+            "routed_w2_packed": tensors["routed_w2"][dst],
             "routed_w2_scale": tensors["routed_w2_scale"][dst],
+            "mxfp4_pair_lut": tensors["mxfp4_pair_lut"][dst],
             "recv_y": recv_y,
         })
         dst_recv_y.append(recv_y)
@@ -1071,9 +1057,10 @@ if __name__ == "__main__":
             ),
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
-            # The complete mHC+MoE block keeps dispatch buffers, shared matmul,
-            # routed matmul and distributed windows live together.
-            ring_heap=1_073_741_824,
+            # The complete mHC+MoE block keeps dispatch buffers, FP8 routed
+            # staging, shared matmul, and distributed windows live together.
+            # The packed routed path exceeded the previous 1 GiB ring on A5.
+            ring_heap=8_589_934_592,
             log_level=args.log_level,
         ),
         rtol=1e-3,

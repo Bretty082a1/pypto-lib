@@ -20,6 +20,91 @@ FP4_VALUES = torch.tensor(
     dtype=torch.float32,
 )
 
+# FP4 E2M1 nibble values encoded as FP8 E4M3FN bytes. The device kernel
+# gathers two adjacent FP8 bytes from this table for every packed input byte.
+FP4_E4M3_CODES = torch.tensor(
+    [0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,
+     0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
+    dtype=torch.int16,
+)
+
+
+def build_mxfp4_pair_lut() -> torch.Tensor:
+    """Build the two-lane byte LUT consumed by the AIV FP4 decoder."""
+    packed = torch.arange(256, dtype=torch.int64)
+    codes = FP4_E4M3_CODES.to(torch.int64)
+    low = codes[packed & 0x0F]
+    high = codes[packed >> 4]
+    pairs = low | (high << 8)
+    pairs = torch.where(pairs < 0x8000, pairs, pairs - 0x10000)
+    return pairs.to(torch.int16).reshape(1, 256).repeat(2, 1).contiguous()
+
+
+def _pack_mxfp4_nibbles_kn_tiles(
+    nibbles_kn: torch.Tensor, k_tile: int, n_tile: int
+) -> torch.Tensor:
+    """Pack a logical [K, N] nibble matrix into Cube lane rows."""
+    k, n = nibbles_kn.shape
+    if k % k_tile or n % n_tile or k_tile % 2 or n_tile % 2:
+        raise ValueError("MXFP4 tile dimensions must divide K/N and be even")
+    k_blocks = k // k_tile
+    n_blocks = n // n_tile
+    blocked = nibbles_kn.reshape(k_blocks, k_tile, n_blocks, n_tile)
+    blocked = blocked.permute(2, 0, 1, 3)
+    lanes = blocked.reshape(n_blocks, k_blocks, 2, k_tile // 2, n_tile)
+    low = lanes[..., 0::2] & 0x0F
+    high = lanes[..., 1::2] & 0x0F
+    packed = low | (high << 4)
+    lane_bytes = k_tile * n_tile // 4
+    return packed.contiguous().reshape(n_blocks * k_blocks * 2, lane_bytes)
+
+
+def pack_mxfp4_weight_tiles(
+    packed_weight_fp4: torch.Tensor, k_tile: int, n_tile: int
+) -> torch.Tensor:
+    """Reorder checkpoint [N, K/2] bytes into Cube FP4 tiles."""
+    payload = packed_weight_fp4.contiguous().view(torch.uint8)
+    *lead, n, half_k = payload.shape
+    k = 2 * half_k
+    matrices = payload.reshape(-1, n, half_k)
+    packed_rows = k * n // n_tile
+    packed_cols = n_tile // 2
+    result = torch.empty(
+        [matrices.shape[0], packed_rows, packed_cols], dtype=torch.uint8
+    )
+    for index, matrix in enumerate(matrices):
+        nibbles = torch.empty([n, k], dtype=torch.uint8)
+        nibbles[:, 0::2] = matrix & 0x0F
+        nibbles[:, 1::2] = matrix >> 4
+        result[index] = _pack_mxfp4_nibbles_kn_tiles(
+            nibbles.t(), k_tile, n_tile
+        ).reshape(packed_rows, packed_cols)
+    return result.reshape(*lead, packed_rows, packed_cols)
+
+
+def unpack_mxfp4_weight_tiles(
+    packed: torch.Tensor, k: int, n: int, k_tile: int, n_tile: int
+) -> torch.Tensor:
+    """Decode Cube FP4 tiles to an FP8 [K, N] reference matrix."""
+    *lead, tile_rows, lane_bytes = packed.shape
+    k_blocks = k // k_tile
+    n_blocks = n // n_tile
+    if tile_rows != n_blocks * k_blocks * 2 or lane_bytes != k_tile * n_tile // 4:
+        raise ValueError("MXFP4 tile payload does not match requested matrix")
+    payloads = packed.contiguous().view(torch.uint8).reshape(-1, tile_rows, lane_bytes)
+    output = torch.empty(payloads.shape[0], k, n, dtype=torch.float8_e4m3fn)
+    for batch in range(payloads.shape[0]):
+        lane_shape = (n_blocks, k_blocks, 2, k_tile // 2, n_tile // 2)
+        lane_bytes_view = payloads[batch].reshape(lane_shape)
+        low = lane_bytes_view & 0x0F
+        high = lane_bytes_view >> 4
+        lanes = torch.stack((low, high), dim=-1)
+        blocked = lanes.reshape(n_blocks, k_blocks, k_tile, n_tile)
+        nibbles_kn = blocked.permute(1, 2, 0, 3).reshape(k, n)
+        codes = FP4_E4M3_CODES.to(torch.uint8)[nibbles_kn.to(torch.long)]
+        output[batch] = codes.view(torch.float8_e4m3fn)
+    return output.reshape(*lead, k, n)
+
 
 def decode_e8m0(scale: torch.Tensor) -> torch.Tensor:
     """Decode UE8M0 storage codes into FP32 powers of two."""
@@ -296,6 +381,31 @@ def host_quant_mxfp8_v41(x: torch.Tensor, *, return_e8m0: bool = False):
     if not return_e8m0:
         return payload, scale
     return payload, codes.to(torch.uint8)
+
+
+def host_quant_swiglu_mxfp8_v41(
+    x: torch.Tensor, *, return_e8m0: bool = False
+):
+    """Match CANN SwiGLU's group-32 MXFP8 quantization and upward scale."""
+    value = x.float()
+    groups = value.reshape(*value.shape[:-1], -1, MX_GROUP)
+    maximum = groups.abs().amax(dim=-1).clamp_min(1e-4)
+    # Double precision keeps a one-ULP excess above a power of two from
+    # rounding back onto the boundary before ceil.
+    scale_exponent = torch.ceil(
+        torch.log2((maximum * (1.0 / FP8_E4M3_MAX)).double())
+    ).to(torch.int32)
+    scale = torch.exp2(scale_exponent).float()
+    payload = (
+        (groups / scale.unsqueeze(-1))
+        .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .reshape_as(value)
+    )
+    if not return_e8m0:
+        return payload, scale
+    codes = (scale_exponent + 127).to(torch.uint8)
+    return payload, codes
 
 
 def gen_mxfp8_weight_kn_v41(out: int, inn: int, dequant_std: float, *, chan_cv: float = 0.5, seed: int = 0):
