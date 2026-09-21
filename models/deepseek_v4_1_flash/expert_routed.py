@@ -96,12 +96,12 @@ def expert_routed(
             flat_base = local_i * RECV_MAX
 
             n_rows = pl.read(recv_expert_count, [local_i, 0])
-            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+            n_tiles = pl.max((n_rows + RECV_TILE - 1) // RECV_TILE, 1)
 
             for t in pl.parallel(n_tiles):
                 t0 = t * RECV_TILE
                 flat_t0 = flat_base + t0
-                valid_rows = pl.min(RECV_TILE, n_rows - t0)
+                valid_rows = pl.min(RECV_TILE, pl.max(n_rows - t0, 0))
 
                 with pl.scope():
                     gate_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
@@ -230,12 +230,12 @@ def expert_routed(
                 e_flat_base = local_e * RECV_MAX
 
                 e_rows = pl.read(recv_expert_count, [local_e, 0])
-                e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
+                e_tiles = pl.max((e_rows + RECV_TILE - 1) // RECV_TILE, 1)
 
                 for tt in pl.parallel(e_tiles):
                     tt0 = tt * RECV_TILE
                     flat_tt0 = e_flat_base + tt0
-                    valid_rows = pl.min(RECV_TILE, e_rows - tt0)
+                    valid_rows = pl.min(RECV_TILE, pl.max(e_rows - tt0, 0))
                     h_tile_mx = h_mx[flat_tt0 : flat_tt0 + RECV_TILE]
                     h_tile_scale_backing = h_scale_backing[
                         :, flat_tt0 * H_SCALE : (flat_tt0 + RECV_TILE) * H_SCALE
