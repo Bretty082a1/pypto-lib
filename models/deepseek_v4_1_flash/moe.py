@@ -7,16 +7,18 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
+# ci: a5
 """Expert-parallel MoE dispatch, local expert compute, and routed-output combine."""
+
+import math
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 import torch
-import torch.nn.functional as F
 
 from models.deepseek_v4_1_flash import config as C
-from models.deepseek_v4_1_flash.config import FLASH
+from models.deepseek_v4_1_flash.config import FLASH, HC_DIM, HC_MULT, MIX_HC
 
 C.RECV_MAX = C.EP_SIZE * C.MOE_TOKENS
 
@@ -34,101 +36,62 @@ AUX_WIDTH = C.AUX_WIDTH
 ROUTE_WIDTH = C.ROUTE_WIDTH
 SKIP_SHARED_TEST = "--skip-shared" in __import__("sys").argv
 SKIP_TRANSPORT_TEST = "--skip-transport" in __import__("sys").argv
-from models.deepseek_v4_1_flash.golden import gate, rms_norm
-from models.deepseek_v4_1_flash.quantization import dequantize_mxfp4
-from models.deepseek_v4_1_flash.quantization import dequantize_mxfp8
-from models.deepseek_v4_1_flash.quantization import unpack_mx_b_scale
 
 from models.deepseek_v4_1_flash.gate import gate as npu_gate
 from models.deepseek_v4_1_flash.expert_shared import expert_shared
 from models.deepseek_v4_1_flash.expert_routed import expert_routed
 from models.deepseek_v4_1_flash.ep_transport import dispatch, combine
+from models.deepseek_v4_1_flash.hc_mixes import golden_mhc_mixes, mhc_mixes
+from models.deepseek_v4_1_flash.hc_pre import golden_mhc_pre, mhc_pre
+from models.deepseek_v4_1_flash.hc_post import golden_mhc_post, mhc_post
 
 
-def _golden_expert(
-    x: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-    weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    gate_value = F.linear(x.float(), w1.float()).clamp(max=FLASH.swiglu_limit)
-    up_value = F.linear(x.float(), w3.float()).clamp(-FLASH.swiglu_limit, FLASH.swiglu_limit)
-    hidden = F.silu(gate_value) * up_value
-    output = F.linear(hidden, w2.float())
-    if weights is not None:
-        output = output * weights
-    return output
-
-
-def tp_token_owners(num_tokens: int, tp_size: int, device: torch.device | None = None) -> torch.Tensor:
-    """Assign each replicated TP token row to one rank before EP dispatch."""
-    if tp_size <= 0:
-        raise ValueError("tp_size must be positive")
-    return torch.arange(num_tokens, device=device, dtype=torch.int32).remainder(tp_size)
-
-
-def golden_moe(
-    x: torch.Tensor,
-    norm_weight: torch.Tensor,
-    gate_weight: torch.Tensor,
-    correction_bias: torch.Tensor,
-    routed_w1: torch.Tensor,
-    routed_w1_scale: torch.Tensor,
-    routed_w2: torch.Tensor,
-    routed_w2_scale: torch.Tensor,
-    routed_w3: torch.Tensor,
-    routed_w3_scale: torch.Tensor,
-    shared_w1: torch.Tensor,
-    shared_w1_scale: torch.Tensor,
-    shared_w2: torch.Tensor,
-    shared_w2_scale: torch.Tensor,
-    shared_w3: torch.Tensor,
-    shared_w3_scale: torch.Tensor,
-    token_owners: torch.Tensor | None = None,
-    tp_size: int = 1,
-    num_tokens: int | None = None,
-) -> torch.Tensor:
-    """CPU reference for the V4.1 MoE layer, including the TP token-owner check."""
-    shape = x.shape
-    normalized = rms_norm(x.reshape(-1, shape[-1]), norm_weight)
-    active_tokens = (
-        normalized.shape[0] if num_tokens is None else min(max(num_tokens, 0), normalized.shape[0])
+def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
+    """Generate routed fixture weights at the requested decoded magnitude."""
+    from models.deepseek_v4_1_flash.quantization import (
+        pack_mx_b_scale,
+        prepare_routed_weight_for_device,
+        quantize_mxfp4_weight,
+        unpack_mx_b_scale,
     )
-    if token_owners is not None:
-        if token_owners.shape != (normalized.shape[0],):
-            raise ValueError("token_owners must contain one TP owner per input row")
-        expected = tp_token_owners(normalized.shape[0], tp_size, token_owners.device)
-        if not torch.equal(token_owners.to(torch.int32), expected):
-            raise ValueError("token_owners must assign every replicated row to exactly one TP rank")
-    normalized = normalized[:active_tokens]
-    routed_w1 = dequantize_mxfp4(routed_w1, routed_w1_scale)
-    routed_w2 = dequantize_mxfp4(routed_w2, routed_w2_scale)
-    routed_w3 = dequantize_mxfp4(routed_w3, routed_w3_scale)
-    shared_w1 = dequantize_mxfp8(shared_w1, unpack_mx_b_scale(shared_w1_scale)).transpose(-2, -1)
-    shared_w2 = dequantize_mxfp8(shared_w2, unpack_mx_b_scale(shared_w2_scale)).transpose(-2, -1)
-    shared_w3 = dequantize_mxfp8(shared_w3, unpack_mx_b_scale(shared_w3_scale)).transpose(-2, -1)
-    route_weights, expert_indices = gate(normalized, gate_weight, correction_bias)
-    output = _golden_expert(normalized, shared_w1, shared_w2, shared_w3)
-    for expert_id in range(routed_w1.shape[0]):
-        token_rows, route_columns = torch.where(expert_indices == expert_id)
-        if token_rows.numel() == 0:
-            continue
-        routed = _golden_expert(
-            normalized[token_rows],
-            routed_w1[expert_id],
-            routed_w2[expert_id],
-            routed_w3[expert_id],
+    w1_list, w1s_list = [], []
+    w3_list, w3s_list = [], []
+    w2_list, w2s_list = [], []
+    for expert in range(n_experts):
+        torch.manual_seed(seed_base + expert * 3)
+        w1_packed, w1_scale = quantize_mxfp4_weight(
+            torch.randn(C.MOE_INTER, D) * float(dequant_std["w1"])
         )
-        routed = routed * route_weights[token_rows, route_columns].unsqueeze(-1)
-        output[token_rows] += routed
-    result = x.reshape(-1, shape[-1]).clone()
-    result[:active_tokens] = output.to(x.dtype)
-    return result.reshape(shape)
+        w3_packed, w3_scale = quantize_mxfp4_weight(
+            torch.randn(C.MOE_INTER, D) * float(dequant_std["w3"])
+        )
+        w2_packed, w2_scale = quantize_mxfp4_weight(
+            torch.randn(D, C.MOE_INTER) * float(dequant_std["w2"])
+        )
+        w1, w1s = prepare_routed_weight_for_device(w1_packed, w1_scale)
+        w3, w3s = prepare_routed_weight_for_device(w3_packed, w3_scale)
+        w2, w2s = prepare_routed_weight_for_device(w2_packed, w2_scale)
+        w1_list.append(w1)
+        w1s_list.append(w1s)
+        w3_list.append(w3)
+        w3s_list.append(w3s)
+        w2_list.append(w2)
+        w2s_list.append(w2s)
+    def pack_expert_scales(scales):
+        logical = torch.stack([
+            unpack_mx_b_scale(scale.contiguous().view(torch.uint8))
+            for scale in scales
+        ]).flatten(0, 1)
+        return pack_mx_b_scale(logical).view(torch.float8_e8m0fnu)
+    return (
+        torch.stack(w1_list), pack_expert_scales(w1s_list),
+        torch.stack(w3_list), pack_expert_scales(w3s_list),
+        torch.stack(w2_list), pack_expert_scales(w2s_list),
+    )
 
 
-@pl.jit
-def moe(
+@pl.jit.inline(auto_scope=False)
+def _moe_core(
     x: pl.Tensor[[C.T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
@@ -224,50 +187,308 @@ def moe(
                 routed_output, combine_arrived, token_owners, num_tokens, ep_rank, moe_epoch)
 
 
+@pl.jit.inline(auto_scope=False)
+def moe(
+    x_hc: pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w1_scale: pl.Tensor[
+        [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2_scale: pl.Tensor[
+        [N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w3_scale: pl.Tensor[
+        [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    shared_w1: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[
+        [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    shared_w2: pl.Tensor[[C.MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[
+        [C.MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    shared_w3: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[
+        [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    token_owners: pl.Tensor[[C.T_DYN], pl.INT32],
+    next_pre_mix: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]],
+    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[
+        [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8
+    ],
+    recv_weights: pld.DistributedTensor[
+        [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32
+    ],
+    recv_routes: pld.DistributedTensor[
+        [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
+    ],
+    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    ep_rank: pl.Scalar[pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]:
+    """Run delayed mHC pre-mix, MoE, and residual expansion.
+
+    The input pre_mix is produced by the preceding mHC sublayer. This
+    sublayer's coefficient generation is returned as next_pre_mix for the
+    following sublayer.
+    """
+    t = MOE_TOKENS
+    post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
+    residual_mix = pl.create_tensor(
+        [t, HC_MULT, HC_MULT], dtype=pl.FP32
+    )
+    mhc_mixes(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        next_pre_mix, post_mix, residual_mix,
+    )
+    mhc_pre(x_hc, pre_mix, x_mixed)
+
+    # Keep the transport windows and routed result alive through combine.
+    with pl.scope():
+        # combine writes owner rows only, and _moe_core zero-initialises the
+        # whole buffer as its first action, so non-owner/inactive rows reach
+        # mhc_post as the pure residual expansion.
+        #
+        # This must stay a pl.create_tensor(): pl.full() produces a fill value
+        # with no inferable tensor metadata, and the specializer resolves
+        # combine's `ffn_out` parameter through this definition.  Swapping in
+        # pl.full() fails to compile with
+        #   "missing inferred tensor metadata for parameter 'ffn_out' of 'combine'"
+        sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
+        _moe_core(
+            x_mixed, norm_weight, gate_weight, correction_bias,
+            routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
+            routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
+            shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
+            token_owners, recv_meta, recv_x, recv_scale, recv_weights,
+            recv_routes, arrived, data_arrived, routed_output,
+            combine_arrived, sublayer,
+            num_tokens, ep_rank, group_base, tp_rank, moe_epoch,
+        )
+        mhc_post(sublayer, x_hc, post_mix, residual_mix, x_next)
+    return x_next
+
+
+@pl.jit
+def moe_test(
+    x_hc: pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[C.N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[C.N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w1_scale: pl.Tensor[
+        [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2_scale: pl.Tensor[
+        [N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
+    routed_w3_scale: pl.Tensor[
+        [N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
+        pl.FP8E8M0,
+        pl.MX_B_NN,
+    ],
+    shared_w1: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[
+        [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    shared_w2: pl.Tensor[[C.MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[
+        [C.MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    shared_w3: pl.Tensor[[D, C.MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[
+        [D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    token_owners: pl.Tensor[[C.T_DYN], pl.INT32],
+    next_pre_mix: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[C.T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]],
+    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[
+        [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8
+    ],
+    recv_weights: pld.DistributedTensor[
+        [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32
+    ],
+    recv_routes: pld.DistributedTensor[
+        [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
+    ],
+    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    ep_rank: pl.Scalar[pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[C.T_DYN, HC_MULT, D], pl.FP32]:
+    x_hc.bind_dynamic(0, C.T_DYN)
+    pre_mix.bind_dynamic(0, C.T_DYN)
+    next_pre_mix.bind_dynamic(0, C.T_DYN)
+    x_mixed.bind_dynamic(0, C.T_DYN)
+    x_next.bind_dynamic(0, C.T_DYN)
+    return moe(
+        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_weight, gate_weight, correction_bias,
+        routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
+        routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
+        shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
+        token_owners, next_pre_mix, x_mixed, x_next,
+        recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        arrived, data_arrived, routed_output, combine_arrived,
+        num_tokens, ep_rank, group_base, tp_rank, moe_epoch,
+    )
+
+
 @pl.jit.host
 def l3_moe(
-    x: pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16],
+    x_hc: pl.Tensor[[EP_SIZE, MOE_TOKENS, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[EP_SIZE, MOE_TOKENS, HC_MULT], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
     gate_weight: pl.Tensor[[EP_SIZE, C.N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[EP_SIZE, C.N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
-    routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN],
-    routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN],
-    routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER], pl.FP8E8M0],
+    routed_w1: pl.Tensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN
+    ],
+    routed_w1_scale: pl.Tensor[
+        [EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
+        pl.FP8E8M0,
+    ],
+    routed_w2: pl.Tensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, C.MOE_INTER, D], pl.FP8E4M3FN
+    ],
+    routed_w2_scale: pl.Tensor[
+        [EP_SIZE, N_LOCAL_EXPERTS * (C.MOE_INTER // MX_GROUP), D],
+        pl.FP8E8M0,
+    ],
+    routed_w3: pl.Tensor[
+        [EP_SIZE, N_LOCAL_EXPERTS, D, C.MOE_INTER], pl.FP8E4M3FN
+    ],
+    routed_w3_scale: pl.Tensor[
+        [EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), C.MOE_INTER],
+        pl.FP8E8M0,
+    ],
     shared_w1: pl.Tensor[[EP_SIZE, D, C.MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0],
+    shared_w1_scale: pl.Tensor[
+        [EP_SIZE, D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0
+    ],
     shared_w2: pl.Tensor[[EP_SIZE, C.MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[[EP_SIZE, C.MOE_INTER // MX_GROUP, D], pl.FP8E8M0],
+    shared_w2_scale: pl.Tensor[
+        [EP_SIZE, C.MOE_INTER // MX_GROUP, D], pl.FP8E8M0
+    ],
     shared_w3: pl.Tensor[[EP_SIZE, D, C.MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0],
+    shared_w3_scale: pl.Tensor[
+        [EP_SIZE, D // MX_GROUP, C.MOE_INTER], pl.FP8E8M0
+    ],
     token_owners: pl.Tensor[[EP_SIZE, MOE_TOKENS], pl.INT32],
-    output: pl.Out[pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16]],
+    next_pre_mix: pl.Out[
+        pl.Tensor[[EP_SIZE, MOE_TOKENS, HC_MULT], pl.FP32]
+    ],
+    x_mixed: pl.Out[
+        pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16]
+    ],
+    x_next: pl.Out[
+        pl.Tensor[[EP_SIZE, MOE_TOKENS, HC_MULT, D], pl.FP32]
+    ],
     num_tokens: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """EP host driver matching the V4 ``l3_moe`` validation structure."""
-    recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-    recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-    recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+    """EP host driver for the mHC-wrapped Flash MoE block."""
+    recv_meta_buf = pld.alloc_window_buffer(
+        [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32
+    )
+    recv_x_buf = pld.alloc_window_buffer(
+        [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8
+    )
+    recv_scale_buf = pld.alloc_window_buffer(
+        [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8
+    )
+    recv_weights_buf = pld.alloc_window_buffer(
+        [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32
+    )
+    recv_routes_buf = pld.alloc_window_buffer(
+        [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32
+    )
     arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
+    routed_output_buf = pld.alloc_window_buffer(
+        [MOE_TOKENS * TOPK, D], dtype=pl.BF16
+    )
     combine_arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale = pld.window(recv_scale_buf, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-        recv_weights = pld.window(recv_weights_buf, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-        recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+        recv_meta = pld.window(
+            recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32
+        )
+        recv_x = pld.window(
+            recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8
+        )
+        recv_scale = pld.window(
+            recv_scale_buf,
+            [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP],
+            dtype=pl.UINT8,
+        )
+        recv_weights = pld.window(
+            recv_weights_buf,
+            [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH],
+            dtype=pl.FP32,
+        )
+        recv_routes = pld.window(
+            recv_routes_buf,
+            [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH],
+            dtype=pl.INT32,
+        )
         arrived = pld.window(arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
-        routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
+        data_arrived = pld.window(
+            data_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32
+        )
+        routed_output = pld.window(
+            routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16
+        )
+        combine_arrived = pld.window(
+            combine_arrived_buf, [EP_SIZE, 1], dtype=pl.INT32
+        )
         # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
         routed_w1_scale_r: pl.Tensor[
             [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
@@ -281,19 +502,21 @@ def l3_moe(
         shared_w1_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[r]
         shared_w2_scale_r: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[r]
         shared_w3_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[r]
-        moe(
-            x[r], norm_weight[r], gate_weight[r], correction_bias[r],
+        moe_test(
+            x_hc[r], pre_mix[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
+            norm_weight[r], gate_weight[r], correction_bias[r],
             routed_w1[r], routed_w1_scale_r, routed_w2[r], routed_w2_scale_r,
             routed_w3[r], routed_w3_scale_r, shared_w1[r], shared_w1_scale_r,
             shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
-            token_owners[r], recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-            arrived, data_arrived, routed_output, combine_arrived, output[r],
+            token_owners[r], next_pre_mix[r], x_mixed[r], x_next[r],
+            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            arrived, data_arrived, routed_output, combine_arrived,
             num_tokens, r, pl.const(0, pl.INT32), r, moe_epoch, device=r,
         )
 
 
 # ---------------------------------------------------------------------------
-# Standalone full-MoE validation harness
+# Full mHC+MoE validation harness
 # ---------------------------------------------------------------------------
 
 
@@ -322,13 +545,12 @@ def _route_bias() -> torch.Tensor:
     return bias
 
 
-def build_tensor_specs(num_tokens: int = MOE_TOKENS):
+def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     import torch
 
     from golden.spec import ScalarSpec, TensorSpec
     from models.deepseek_v4_1_flash.expert_routed import (
         ROUTED_DEQUANT_STD,
-        gen_routed_mx_weights,
     )
     from models.deepseek_v4_1_flash.quantization import gen_mxfp8_weight_kn_v41
 
@@ -356,7 +578,7 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     routed_w3_list, routed_w3_scale_list = [], []
     routed_w2_list, routed_w2_scale_list = [], []
     for rank in range(EP_SIZE):
-        rw1, rw1_s, rw3, rw3_s, rw2, rw2_s = gen_routed_mx_weights(
+        rw1, rw1_s, rw3, rw3_s, rw2, rw2_s = _gen_routed_mx_weights_fixture(
             N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3
         )
         routed_w1_list.append(rw1)
@@ -414,7 +636,91 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     return specs
 
 
-def golden_l3_moe(tensors):
+
+def build_tensor_specs(num_tokens: int = MOE_TOKENS):
+    """Build the default mHC+MoE integration fixture."""
+    import torch
+    from golden.spec import TensorSpec
+
+    base_specs = _build_moe_tensor_specs(num_tokens)
+    common_specs = [
+        spec for spec in base_specs
+        if spec.name not in {"x", "output", "num_tokens", "moe_epoch"}
+    ]
+    scalar_specs = [
+        spec for spec in base_specs
+        if spec.name in {"num_tokens", "moe_epoch"}
+    ]
+
+    generator = torch.Generator().manual_seed(3)
+    magnitudes = (0.5 + torch.arange(MOE_TOKENS) % 4).reshape(1, -1, 1, 1)
+    # The coefficient RMS path must observe distinct token scales. The residual
+    # stream stores BF16 model values in FP32 so mHC post performs one rounding.
+    x_hc = (torch.randn(
+        EP_SIZE, MOE_TOKENS, HC_MULT, D, generator=generator
+    ) * magnitudes).bfloat16().float()
+    pre_mix = torch.sigmoid(torch.randn(
+        EP_SIZE, MOE_TOKENS, HC_MULT, generator=generator
+    )) + FLASH.hc_eps
+    hc_ffn_fn = torch.randn(
+        MIX_HC, HC_DIM, generator=generator
+    ) / math.sqrt(HC_DIM)
+    hc_ffn_scale = torch.randn(3, generator=generator)
+    hc_ffn_base = torch.randn(MIX_HC, generator=generator)
+    hc_ffn_fn = hc_ffn_fn.unsqueeze(0).expand(
+        EP_SIZE, -1, -1
+    ).contiguous()
+    hc_ffn_scale = hc_ffn_scale.unsqueeze(0).expand(
+        EP_SIZE, -1
+    ).contiguous()
+    hc_ffn_base = hc_ffn_base.unsqueeze(0).expand(
+        EP_SIZE, -1
+    ).contiguous()
+
+    mhc_specs = [
+        TensorSpec(
+            "x_hc", [EP_SIZE, MOE_TOKENS, HC_MULT, D],
+            torch.float32, init_value=lambda: x_hc,
+        ),
+        TensorSpec(
+            "pre_mix", [EP_SIZE, MOE_TOKENS, HC_MULT],
+            torch.float32, init_value=lambda: pre_mix,
+        ),
+        TensorSpec(
+            "hc_ffn_fn", [EP_SIZE, MIX_HC, HC_DIM],
+            torch.float32, init_value=lambda: hc_ffn_fn,
+        ),
+        TensorSpec(
+            "hc_ffn_scale", [EP_SIZE, 3],
+            torch.float32, init_value=lambda: hc_ffn_scale,
+        ),
+        TensorSpec(
+            "hc_ffn_base", [EP_SIZE, MIX_HC],
+            torch.float32, init_value=lambda: hc_ffn_base,
+        ),
+    ]
+    next_pre_mix_spec = TensorSpec(
+        "next_pre_mix", [EP_SIZE, MOE_TOKENS, HC_MULT], torch.float32
+    )
+    x_mixed_spec = TensorSpec(
+        "x_mixed", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16
+    )
+    x_next_spec = TensorSpec(
+        "x_next", [EP_SIZE, MOE_TOKENS, HC_MULT, D], torch.float32
+    )
+    # Match l3_moe's ABI: mHC inputs, MoE weights/route inputs, outputs,
+    # then runtime scalars.
+    output_specs = [next_pre_mix_spec, x_mixed_spec, x_next_spec]
+    specs = mhc_specs + common_specs + output_specs + scalar_specs
+    for spec in specs:
+        if spec.name in {
+            "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
+        }:
+            spec.resident = "stacked"
+    return specs
+
+
+def _golden_moe_core(tensors):
     import torch
 
     from models.deepseek_v4_1_flash.gate import golden_gate_core
@@ -569,53 +875,131 @@ def golden_l3_moe(tensors):
     tensors["output"][:] = output
 
 
-def moe_output_compare(num_tokens: int):
+def golden_moe(tensors):
+    """Compose the validated mHC references around the MoE reference."""
+    import torch
+
+    x_hc = tensors["x_hc"]
+    next_pre_mix = torch.zeros(
+        EP_SIZE, MOE_TOKENS, HC_MULT, dtype=torch.float32
+    )
+    post_mix = torch.zeros_like(next_pre_mix)
+    residual_mix = torch.zeros(
+        EP_SIZE, MOE_TOKENS, HC_MULT, HC_MULT, dtype=torch.float32
+    )
+    x_mixed = torch.zeros(
+        EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16
+    )
+    for rank in range(EP_SIZE):
+        pre, post, residual = golden_mhc_mixes(
+            x_hc[rank],
+            tensors["hc_ffn_fn"][rank],
+            tensors["hc_ffn_scale"][rank],
+            tensors["hc_ffn_base"][rank],
+        )
+        next_pre_mix[rank] = pre
+        post_mix[rank] = post
+        residual_mix[rank] = residual
+        x_mixed[rank] = golden_mhc_pre(
+            x_hc[rank], tensors["pre_mix"][rank]
+        )
+
+    tensors["next_pre_mix"][:] = next_pre_mix
+    tensors["x_mixed"][:] = x_mixed
+
+    # Reuse the MoE reference exactly; only its input/output tensors change.
+    # This keeps the composition test from growing a second transport
+    # reference that could drift from the validated one.
+    moe_tensors = dict(tensors)
+    moe_tensors["x"] = x_mixed
+    sublayer = torch.zeros(
+        EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16
+    )
+    moe_tensors["output"] = sublayer
+    _golden_moe_core(moe_tensors)
+
+    x_next = torch.zeros(
+        EP_SIZE, MOE_TOKENS, HC_MULT, D, dtype=torch.float32
+    )
+    for rank in range(EP_SIZE):
+        x_next[rank] = golden_mhc_post(
+            sublayer[rank], x_hc[rank],
+            post_mix[rank], residual_mix[rank],
+        )
+    tensors["x_next"][:] = x_next
+
+
+def _token_owner_mhc_compare(num_tokens: int):
+    """Apply the MoE budget to owner and non-owner rows alike.
+
+    ``combine`` writes owner rows only, so a non-owner row arriving here is the
+    pure residual expansion produced by ``mhc_post``.  Its coefficients come
+    from ``mhc_mixes``, which the sibling entry validates on device at
+    ``rtol=5e-3`` / ``atol=2.5e-5``; demanding bitwise equality here would
+    instead assert that torch reproduces the AI core's ``exp``/``rsqrt``
+    exactly, which it cannot.  The BF16 rounding in ``mhc_post`` turns a
+    sub-ulp coefficient difference into a whole-ulp output difference, so an
+    exact gate fails on rounding-boundary flips alone (~0.1% of the elements,
+    while the relative budget passes with ~150x headroom).
+
+    Ownership is still enforced: ``token_owners`` must select exactly one rank
+    per active token, and the owner and non-owner groups are compared
+    independently, so a rank that wrote rows it does not own still fails.
+    """
     import torch
 
     from golden.validation import ratio_reldiff
 
     active = max(0, min(MOE_TOKENS, int(num_tokens)))
-    active_compare = ratio_reldiff(diff_thd=3e-3, pct_thd=0.02)
+    budget = dict(
+        diff_thd=3e-3,
+        pct_thd=0.02,
+        max_diff_hd=1.0,
+    )
+    owner_compare = ratio_reldiff(**budget)
+    other_compare = ratio_reldiff(**budget)
 
     def compare(actual, expected, **kwargs):
         if actual.shape != expected.shape:
-            return False, f"    output shape mismatch: actual={tuple(actual.shape)} expected={tuple(expected.shape)}"
-        if not torch.isfinite(actual.float()).all().item():
-            return False, "    output contains NaN or Inf"
-        owners = kwargs.get("inputs", {}).get("token_owners")
-        if owners is None:
-            return False, "    compare_fn misconfigured: missing token_owners"
-        rows = []
-        for rank in range(actual.shape[0]):
-            for t in range(active):
-                if int(owners[rank, t].item()) == rank:
-                    rows.append((rank, t))
-        if rows:
-            rank_idx = torch.tensor([r for r, _ in rows], dtype=torch.long)
-            token_idx = torch.tensor([t for _, t in rows], dtype=torch.long)
-            ok, detail = active_compare(actual[rank_idx, token_idx], expected[rank_idx, token_idx], **kwargs)
-            if not ok:
-                return False, f"    owner token rows:\n{detail}"
-        mask = torch.ones(actual.shape[:2], dtype=torch.bool)
-        for rank, t in rows:
-            mask[rank, t] = False
-        inactive_actual = actual[mask]
-        inactive_expected = expected[mask]
-        if inactive_actual.numel() and not torch.equal(inactive_actual, inactive_expected):
-            diff = (inactive_actual.float() - inactive_expected.float()).abs()
             return False, (
-                f"    non-owner/inactive rows changed: values={int((inactive_actual != inactive_expected).sum().item())}, "
-                f"max_abs_diff={float(diff.max().item()):.6g}"
+                f"    output shape mismatch: actual={tuple(actual.shape)} "
+                f"expected={tuple(expected.shape)}"
             )
-        return True, ""
+        owners = kwargs["inputs"].get("token_owners")
+        if owners is None or tuple(owners.shape) != tuple(actual.shape[:2]):
+            return False, "    token_owners is missing or has the wrong shape"
 
-    compare.__name__ = f"moe_output_compare(num_tokens={active})"
+        ranks = torch.arange(actual.shape[0], dtype=torch.int64).reshape(-1, 1)
+        owner_active = owners[:, :active].to(torch.int64).cpu() == ranks
+        if not (owner_active.sum(dim=0) == 1).all().item():
+            return False, "    token_owners must select one rank per active token"
+
+        other_mask = torch.ones(actual.shape[:2], dtype=torch.bool)
+        other_mask[:, :active] = ~owner_active
+        bitwise = int((actual[other_mask] != expected[other_mask]).sum())
+        other_ok, other_message = other_compare(
+            actual[other_mask].unsqueeze(0),
+            expected[other_mask].unsqueeze(0),
+            **kwargs,
+        )
+        if not other_ok:
+            return False, (
+                "    non-owner or inactive rows left the MoE budget "
+                f"({bitwise} elements differ bitwise)\n{other_message}"
+            )
+
+        return owner_compare(
+            actual[:, :active][owner_active].unsqueeze(0),
+            expected[:, :active][owner_active].unsqueeze(0),
+            **kwargs,
+        )
+
+    compare.__name__ = f"token_owner_mhc_compare(num_tokens={active})"
     return compare
 
 
 __all__ = [
-    "golden_moe", "golden_l3_moe", "build_tensor_specs",
-    "moe", "l3_moe", "tp_token_owners",
+    "golden_moe", "build_tensor_specs", "moe", "moe_test", "l3_moe",
 ]
 
 
@@ -627,6 +1011,7 @@ if __name__ == "__main__":
     _model_dir = pathlib.Path(__file__).resolve().parent
     sys.path = [item for item in sys.path if pathlib.Path(item or ".").resolve() != _model_dir]
 
+    from golden import ratio_allclose
     from golden.runner import run
 
     parser = argparse.ArgumentParser()
@@ -658,10 +1043,22 @@ if __name__ == "__main__":
             "with the desired values, for example `python -m models.deepseek_v4_1_flash.moe --ep 8 --tp 2 ...`"
         )
 
+    # The public validation entry is the complete mHC+MoE block.  The plain
+    # MoE kernel remains an internal subroutine of ``moe`` and is not exposed
+    # as a second standalone runner.
+    entry = l3_moe
+    specs = build_tensor_specs(args.num_tokens)
+    golden_fn = golden_moe
+    compare_fn = {
+        "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+        "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        "x_next": _token_owner_mhc_compare(args.num_tokens),
+    }
+
     result = run(
-        fn=l3_moe,
-        specs=build_tensor_specs(num_tokens=args.num_tokens),
-        golden_fn=golden_l3_moe,
+        fn=entry,
+        specs=specs,
+        golden_fn=golden_fn,
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
@@ -674,17 +1071,14 @@ if __name__ == "__main__":
             ),
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
-            # Full MoE keeps dispatch buffers, shared matmul, routed matmul and
-            # distributed windows live together; use the same 1 GiB ring heap as
-            # the standalone routed expert regression.
+            # The complete mHC+MoE block keeps dispatch buffers, shared matmul,
+            # routed matmul and distributed windows live together.
             ring_heap=1_073_741_824,
             log_level=args.log_level,
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            "output": moe_output_compare(args.num_tokens),
-        },
+        compare_fn=compare_fn,
     )
     if not result.passed:
         if result.error:
