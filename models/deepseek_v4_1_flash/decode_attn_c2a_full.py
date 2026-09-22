@@ -69,7 +69,9 @@ from models.deepseek_v4_1_flash.quantization import (
     quantize_mxfp4_cache,
     unpack_mx_b_scale,
 )
-from models.deepseek_v4_1_flash.rope_tables import select_rope_rows
+from models.deepseek_v4_1_flash.rope_tables import (
+    ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables,
+)
 
 
 # Cache codec. Payloads are packed E2M1, two logical values per byte.
@@ -418,16 +420,22 @@ def index_select(
         if length <= INDEX_TOPK:
             for c in pl.range(INDEX_TOPK // SCORE_TILE):
                 p0 = c * SCORE_TILE
-                block_id = pl.read(block_table, [request, p0 // 128])
-                ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                # Integer scalars broadcast correctly into a tensor op; an FP32 runtime
-                # scalar does not, and a one-element column is below the tile alignment.
-                slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                block_base = pl.cast(block_id * 128 + p0 % 128, pl.INT32)
-                physical = pl.cast(pl.add(ramp, block_base), pl.FP32)
-                masked = pl.sub(pl.mul(visible, pl.add(physical, 1.0)), 1.0)
-                topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.cast(masked, pl.INT32, mode="rint")
+                # Inactive tiles need no page-table entry.
+                if p0 < length:
+                    block_id = pl.read(block_table, [request, p0 // 128])
+                    ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
+                    # Integer scalars broadcast correctly into a tensor op; an FP32 runtime
+                    # scalar does not, and a one-element column is below the tile alignment.
+                    slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
+                    visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
+                    block_base = pl.cast(block_id * 128 + p0 % 128, pl.INT32)
+                    physical = pl.cast(pl.add(ramp, block_base), pl.FP32)
+                    masked = pl.sub(pl.mul(visible, pl.add(physical, 1.0)), 1.0)
+                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.cast(masked, pl.INT32, mode="rint")
+                else:
+                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.full(
+                        [1, SCORE_TILE], dtype=pl.INT32, value=-1
+                    )
         else:
             running = pl.tile.full([1, PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
             weight_row = pl.reshape(pl.cast(weights[t : t + 1, :], pl.FP32), [INDEX_H, 1])
@@ -435,81 +443,90 @@ def index_select(
                 leaf_base = leaf * LEAF
                 for c in pl.range(LEAF_TILES):
                     p0 = leaf_base + c * SCORE_TILE
-                    block_id = pl.read(block_table, [request, p0 // 128])
-                    base = pl.cast(pl.max(block_id, 0), pl.INDEX) * 128 + p0 % 128
-                    packed = flat[base : base + SCORE_TILE, :]
-                    wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
-                    low = pl.ands(wide, 15)
-                    high = pl.ands(pl.shrs(wide, 4), 15)
-                    low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
-                    low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
-                    low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                    # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                    # unsupported integer cast on the exponent-assembly path.
-                    low_pow2 = pl.div(
-                        pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
-                                      pl.mul(low_exponent, 5.0)), 6.0),
-                        6.0,
-                    )
-                    low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
-                    low_is_normal = pl.minimum(low_exponent, 1.0)
-                    low_magnitude = pl.add(
-                        pl.mul(low_is_normal, low_normal),
-                        pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
-                    )
-                    low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
-                    high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
-                    high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
-                    high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                    # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                    # unsupported integer cast on the exponent-assembly path.
-                    high_pow2 = pl.div(
-                        pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
-                                      pl.mul(high_exponent, 5.0)), 6.0),
-                        6.0,
-                    )
-                    high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
-                    high_is_normal = pl.minimum(high_exponent, 1.0)
-                    high_magnitude = pl.add(
-                        pl.mul(high_is_normal, high_normal),
-                        pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
-                    )
-                    high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
-                    scale_tile = pl.slice(scale_wide, [SCORE_TILE // 8, 32], [base // 8, 0])
-                    raw_codes = pl.reinterpret_view(scale_tile, pl.UINT8)
-                    signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                    codes = pl.ands(signed_codes, 255)
-                    factors = pl.reinterpret_view(
-                        pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
-                    )
-                    factor_column = pl.reshape(factors, [SCORE_TILE * IDX_SCALES, 1])
-                    low_scaled = pl.reshape(
-                        pl.row_expand_mul(
-                            pl.reshape(low_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                        ),
-                        [SCORE_TILE, IDX_PACKED],
-                    )
-                    high_scaled = pl.reshape(
-                        pl.row_expand_mul(
-                            pl.reshape(high_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                        ),
-                        [SCORE_TILE, IDX_PACKED],
-                    )
-                    keys = pl.concat(
-                        pl.cast(low_scaled, pl.BF16, mode="rint"),
-                        pl.cast(high_scaled, pl.BF16, mode="rint"),
-                    )
-                    query_tile = query_flat[t * INDEX_H : t * INDEX_H + INDEX_H, :]
-                    scored = pl.maximum(pl.matmul(query_tile, keys, b_trans=True), 0.0)
-                    row = pl.col_sum(pl.row_expand_mul(scored, weight_row))
-                    ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                    slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                    visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                    row = pl.maximum(pl.add(row, pl.mul(pl.sub(visible, 1.0), MASK_BIAS)), SORT_FLOOR)
-                    leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = row
-                    leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.add(
-                        ramp, pl.cast(base, pl.INT32)
-                    )
+                    # The last leaf may extend beyond the visible page table.
+                    if p0 < length:
+                        block_id = pl.read(block_table, [request, p0 // 128])
+                        base = pl.cast(pl.max(block_id, 0), pl.INDEX) * 128 + p0 % 128
+                        packed = flat[base : base + SCORE_TILE, :]
+                        wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
+                        low = pl.ands(wide, 15)
+                        high = pl.ands(pl.shrs(wide, 4), 15)
+                        low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
+                        low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
+                        low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
+                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
+                        # unsupported integer cast on the exponent-assembly path.
+                        low_pow2 = pl.div(
+                            pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
+                                          pl.mul(low_exponent, 5.0)), 6.0),
+                            6.0,
+                        )
+                        low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
+                        low_is_normal = pl.minimum(low_exponent, 1.0)
+                        low_magnitude = pl.add(
+                            pl.mul(low_is_normal, low_normal),
+                            pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
+                        )
+                        low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
+                        high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
+                        high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
+                        high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
+                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
+                        # unsupported integer cast on the exponent-assembly path.
+                        high_pow2 = pl.div(
+                            pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
+                                          pl.mul(high_exponent, 5.0)), 6.0),
+                            6.0,
+                        )
+                        high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
+                        high_is_normal = pl.minimum(high_exponent, 1.0)
+                        high_magnitude = pl.add(
+                            pl.mul(high_is_normal, high_normal),
+                            pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
+                        )
+                        high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
+                        scale_tile = pl.slice(scale_wide, [SCORE_TILE // 8, 32], [base // 8, 0])
+                        raw_codes = pl.reinterpret_view(scale_tile, pl.UINT8)
+                        signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
+                        codes = pl.ands(signed_codes, 255)
+                        factors = pl.reinterpret_view(
+                            pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
+                        )
+                        factor_column = pl.reshape(factors, [SCORE_TILE * IDX_SCALES, 1])
+                        low_scaled = pl.reshape(
+                            pl.row_expand_mul(
+                                pl.reshape(low_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
+                            ),
+                            [SCORE_TILE, IDX_PACKED],
+                        )
+                        high_scaled = pl.reshape(
+                            pl.row_expand_mul(
+                                pl.reshape(high_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
+                            ),
+                            [SCORE_TILE, IDX_PACKED],
+                        )
+                        keys = pl.concat(
+                            pl.cast(low_scaled, pl.BF16, mode="rint"),
+                            pl.cast(high_scaled, pl.BF16, mode="rint"),
+                        )
+                        query_tile = query_flat[t * INDEX_H : t * INDEX_H + INDEX_H, :]
+                        scored = pl.maximum(pl.matmul(query_tile, keys, b_trans=True), 0.0)
+                        row = pl.col_sum(pl.row_expand_mul(scored, weight_row))
+                        ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
+                        slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
+                        visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
+                        row = pl.maximum(pl.add(row, pl.mul(pl.sub(visible, 1.0), MASK_BIAS)), SORT_FLOOR)
+                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = row
+                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.add(
+                            ramp, pl.cast(base, pl.INT32)
+                        )
+                    else:
+                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
+                            [1, SCORE_TILE], dtype=pl.FP32, value=SORT_FLOOR
+                        )
+                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
+                            [1, SCORE_TILE], dtype=pl.INT32, value=-1
+                        )
                 score_row = pl.load(leaf_scores, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
                 row_ids = pl.load(leaf_rows, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
                 pairs = pl.sort32(score_row, pl.reinterpret_view(row_ids, pl.UINT32))
@@ -1295,6 +1312,18 @@ INPUT_NAMES = (
     "index_wk", "index_norm_weight", "index_wq_b", "index_wq_b_scale", "index_weights_proj",
 )
 
+FULL_ROPE_NAMES = {
+    "rope_cos": "freqs_cos", "rope_sin": "freqs_sin",
+    "compressed_rope_cos": "compressed_freqs_cos",
+    "compressed_rope_sin": "compressed_freqs_sin",
+}
+PROGRAM_INPUT_NAMES = tuple(
+    entry
+    for name in INPUT_NAMES
+    for entry in (("compressed_rope_positions", name) if name == "compressor_wkv"
+                  else (FULL_ROPE_NAMES.get(name, name),))
+)
+
 # "long" drives compressed_lens above INDEX_TOPK for part of the batch so the indexer must
 # score and select; the short requests in the same batch keep the -1 padding path live.
 _PREFIXES = {
@@ -1319,7 +1348,7 @@ def _plan(tokens, requests, case, mode):
     prefixes = [pattern[index % len(pattern)] for index in range(requests)]
     return lengths, prefixes
 
-def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode"):
+def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode", full_rope_tables=False):
     """Deterministic inputs for ``golden_decode_attn_c2a_full``.
 
     case: "mixed" keeps contexts short so every causal position is selected, "long" pushes
@@ -1383,10 +1412,15 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode")
     published_slots = compressed_slots[compressed_slots >= 0]
     assert published_slots.unique().numel() == published_slots.numel()
 
-    rope_cos, rope_sin = select_rope_rows(positions, compressed_attention=False)
+    # Fixture initialization only: production callers retain these full tables.
+    table_rows = int(positions.max()) + 1
+    freqs_cos, freqs_sin = precompute_rope_tables(table_rows, compressed_attention=False)
+    compressed_freqs_cos, compressed_freqs_sin = precompute_rope_tables(table_rows, compressed_attention=True)
+    rope_cos, rope_sin = freqs_cos[positions], freqs_sin[positions]
     complete = (positions + 1).remainder(RATIO) == 0
     pair_start = torch.where(complete, positions + 1 - RATIO, torch.full_like(positions, -1))
-    compressed_rope_cos, compressed_rope_sin = select_rope_rows(pair_start, compressed_attention=True)
+    compressed_rope_cos = compressed_freqs_cos[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 1.0)
+    compressed_rope_sin = compressed_freqs_sin[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 0.0)
 
     wq_a, wq_a_scale = _weight(gen, C.D, C.Q_LORA)
     wq_b, wq_b_scale = _weight(gen, C.Q_LORA, C.LOCAL_H * C.HEAD_DIM)
@@ -1487,6 +1521,13 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode")
         f"window_pages={window_pages} compressed_pages={compressed_pages} "
         f"index_block_table={tuple(index_block_table.shape)}"
     )
+    if full_rope_tables:
+        values.update(
+            freqs_cos=freqs_cos, freqs_sin=freqs_sin,
+            compressed_freqs_cos=compressed_freqs_cos, compressed_freqs_sin=compressed_freqs_sin,
+            compressed_rope_positions=pair_start.to(torch.int32),
+        )
+        return {name: values[name] for name in PROGRAM_INPUT_NAMES}
     return {name: values[name] for name in INPUT_NAMES}
 
 
@@ -1515,7 +1556,7 @@ CACHE_PAYLOADS = {
 }
 
 
-def make_golden(epochs):
+def make_golden(epochs, full_rope_tables=True):
     """Reference each TP shard independently, then perform the FP32 TP reduction.
 
     The ratio-2 compressor carries request-scoped state, so unlike SWA this
@@ -1529,7 +1570,17 @@ def make_golden(epochs):
         for base in range(0, world_size, TP_SIZE):
             partials = []
             for rank in range(base, base + TP_SIZE):
-                inputs = {name: tensors[name][rank] for name in INPUT_NAMES}
+                if full_rope_tables:
+                    inputs = {name: tensors[name][rank] for name in INPUT_NAMES if name not in FULL_ROPE_NAMES}
+                    for row_name, table_name in FULL_ROPE_NAMES.items():
+                        positions_name = "compressed_rope_positions" if row_name.startswith("compressed_") else "position_ids"
+                        positions = tensors[positions_name][rank].to(torch.long)
+                        identity = 1.0 if row_name.endswith("cos") else 0.0
+                        inputs[row_name] = tensors[table_name][rank][positions.clamp_min(0)].masked_fill(
+                            positions[:, None] < 0, identity
+                        )
+                else:
+                    inputs = {name: tensors[name][rank] for name in INPUT_NAMES}
                 for _ in range(epochs):
                     result = official_reference_c2a(inputs)
                     for name in MUTABLE_NAMES:
@@ -1718,8 +1769,8 @@ def make_program(operator, capacity, world_size, epochs):
         wo_a: pl.Tensor[[C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
@@ -1732,8 +1783,9 @@ def make_program(operator, capacity, world_size, epochs):
         index_cache_scale: pl.InOut[pl.Tensor[[C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
         index_block_table: pl.Tensor[[C.B_DYN, C.TABLE_DYN], pl.INT32],
         position_ids: pl.Tensor[[C.T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_rope_positions: pl.Tensor[[C.T_DYN], pl.INT32],
         compressor_wkv: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[C.D, C.HEAD_DIM], pl.FP32],
         query_start_loc: pl.Tensor[[C.Q_START_DYN], pl.INT32],
@@ -1755,6 +1807,7 @@ def make_program(operator, capacity, world_size, epochs):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Run one rank of C2A attention, skipping idle work."""
+        freqs_cos.bind_dynamic(0, ROPE_ROWS_DYN)
         x.bind_dynamic(0, T_DYN)
         window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
@@ -1765,6 +1818,16 @@ def make_program(operator, capacity, world_size, epochs):
         state_block_table.bind_dynamic(0, C.B_DYN)
         state_cache.bind_dynamic(0, C.STATE_BLOCKS_DYN)
         if num_tokens > 0:
+            tokens = pl.tensor.dim(x, 0)
+            rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+            rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+            compressed_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+            compressed_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+            materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos, rope_sin)
+            materialize_rope_rows(
+                compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, num_tokens,
+                compressed_rope_cos, compressed_rope_sin,
+            )
             for step in pl.range(epochs):
                 operator(
                     x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
@@ -1798,8 +1861,8 @@ def make_program(operator, capacity, world_size, epochs):
         wo_a: pl.Tensor[[world_size, C.LOCAL_O_GROUPS, C.O_LORA, C.O_GROUP_IN], pl.BF16],
         wo_b: pl.Tensor[[world_size, C.LOCAL_O_WIDTH, C.D], pl.FP8E4M3FN],
         wo_b_scale: pl.Tensor[[world_size, C.LOCAL_O_WIDTH // 32, C.D], pl.FP8E8M0],
-        rope_cos: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_cos: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        freqs_sin: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
         window_slots: pl.Tensor[[world_size, C.T_DYN], pl.INT64],
         window_indices: pl.Tensor[[world_size, C.T_DYN, 128], pl.INT32],
         window_cache: pl.InOut[pl.Tensor[[world_size, C.ORI_BLOCKS_DYN, 128, 1, C.HEAD_DIM], pl.FP8E4M3FN]],
@@ -1812,8 +1875,9 @@ def make_program(operator, capacity, world_size, epochs):
         index_cache_scale: pl.InOut[pl.Tensor[[world_size, C.INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0]],
         index_block_table: pl.Tensor[[world_size, C.B_DYN, C.TABLE_DYN], pl.INT32],
         position_ids: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
-        compressed_rope_cos: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
-        compressed_rope_sin: pl.Tensor[[world_size, C.T_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_cos: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_freqs_sin: pl.Tensor[[world_size, ROPE_ROWS_DYN, C.ROPE_DIM // 2], pl.FP32],
+        compressed_rope_positions: pl.Tensor[[world_size, C.T_DYN], pl.INT32],
         compressor_wkv: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
         compressor_wgate: pl.Tensor[[world_size, C.D, C.HEAD_DIM], pl.FP32],
         query_start_loc: pl.Tensor[[world_size, C.Q_START_DYN], pl.INT32],
@@ -1832,6 +1896,7 @@ def make_program(operator, capacity, world_size, epochs):
         attention_epoch: pl.Scalar[pl.INT32],
     ):
         """Dispatch C2A attention across TP groups with shared output windows."""
+        freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
         x.bind_dynamic(1, T_DYN)
         window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
         compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
@@ -1859,12 +1924,12 @@ def make_program(operator, capacity, world_size, epochs):
             c2a_rank(
                 x[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
                 wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
-                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank],
-                rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
+                attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, freqs_cos[rank],
+                freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
                 window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
                 token_to_req_indices[rank], compressed_lens[rank], index_cache[rank],
                 index_cache_scale[rank], index_block_table[rank], position_ids[rank],
-                compressed_rope_cos[rank], compressed_rope_sin[rank], compressor_wkv[rank],
+                compressed_freqs_cos[rank], compressed_freqs_sin[rank], compressed_rope_positions[rank], compressor_wkv[rank],
                 compressor_wgate[rank], query_start_loc[rank], state_block_table[rank], state_cache[rank],
                 compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
                 index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
@@ -1876,8 +1941,9 @@ def make_program(operator, capacity, world_size, epochs):
 
 
 
-def build_specs(args, mode):
+def build_specs(args, mode, full_rope_tables=True):
     """Build shape-only specs; replay and compile-only never generate random weights."""
+    input_names = PROGRAM_INPUT_NAMES if full_rope_tables else INPUT_NAMES
     world_size = TP_SIZE * args.dp
     ranks = {}
 
@@ -1889,12 +1955,12 @@ def build_specs(args, mode):
                     requests=args.requests,
                     seed=args.seed + rank,
                     case=args.case,
-                    mode=mode,
+                    mode=mode, full_rope_tables=full_rope_tables,
                 )
             # Every rank of a TP group sees the same tokens, metadata and caches.
             for rank in range(world_size):
                 leader = ranks[rank // TP_SIZE * TP_SIZE]
-                for key in INPUT_NAMES:
+                for key in input_names:
                     if key not in SHARDED_NAMES:
                         ranks[rank][key] = leader[key]
         column = [ranks[rank][name] for rank in range(world_size)]
@@ -1904,7 +1970,7 @@ def build_specs(args, mode):
         return torch.stack(column)
 
     shapes = make_c2a_inputs(
-        tokens=args.tokens, requests=args.requests, seed=args.seed, case=args.case, mode=mode
+        tokens=args.tokens, requests=args.requests, seed=args.seed, case=args.case, mode=mode, full_rope_tables=full_rope_tables
     )
     specs = [
         TensorSpec(
@@ -1914,7 +1980,7 @@ def build_specs(args, mode):
             init_value=(lambda name=name: initialize(name)),
             resident="stacked",
         )
-        for name in INPUT_NAMES
+        for name in input_names
     ]
     specs.append(
         TensorSpec("topk_indices", [world_size, args.tokens, INDEX_TOPK], torch.int32, resident="stacked")
