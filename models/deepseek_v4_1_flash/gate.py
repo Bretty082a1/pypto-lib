@@ -97,7 +97,9 @@ def gate_normalized(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
+    task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
+    active_mask = pl.cast(pl.min(pl.max(num_tokens, 0), 1), pl.FP32)
+    task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     for init_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // GATE_D_TILE), name_hint="gate_normalized_zero"):
@@ -107,8 +109,9 @@ def gate_normalized(
             [GATE_M_TILE, GATE_D_TILE], dtype=pl.FP32, value=0.0
         )
 
-    for tok in pl.spmd(active_tokens, name_hint="gate_normalized_input"):
+    for tok in pl.spmd(task_tokens, name_hint="gate_normalized_input"):
         normalized = pl.cast(pl.tile.load(x_normed, [tok, 0], [1, D]), pl.FP32)
+        normalized = pl.mul(normalized, active_mask)
         pl.tile.store(normalized, [tok, 0], xg_buf, shapes=[1, D])
 
     for quant_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
@@ -142,7 +145,10 @@ def gate_normalized(
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = biased_pad
 
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    for gb_idx in pl.spmd(active_gate_tiles * (N_EXPERTS // GATE_N_TILE), name_hint="gate"):
+    for gb_idx in pl.spmd(
+        task_gate_tiles * (N_EXPERTS // GATE_N_TILE),
+        name_hint="gate",
+    ):
         tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
         nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
         t1 = tg * GATE_M_TILE
@@ -174,14 +180,13 @@ def gate_normalized(
         gp_score = pl.sqrt(gp_softplus)
         route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
         gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
-        if True:
-            gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
-            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+        gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
+        biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
-    active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.
-    for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort"):
+    task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    for ts_idx in pl.spmd(task_route_tiles, name_hint="route_sort"):
             t1 = ts_idx * GATE_T_TILE
             # ptoas pto.tmrgsort requires a single source row.
             topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
