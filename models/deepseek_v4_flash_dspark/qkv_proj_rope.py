@@ -261,7 +261,7 @@ def rope_prepare(
 @pl.jit.inline(auto_scope=False)
 def q_proj_qr(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
@@ -297,6 +297,8 @@ def q_proj_qr(
             for qbg_idx in pl.spmd(
                 (Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True
             ):
+                # Weight reads bypass L2.
+                pl.set_cache_policy(wq_a, pl.CachePolicy.BYPASS)
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_SPLIT_K_TILE
                 for dense_t0 in pl.range(0, qr_full_rows, QR_DENSE_M_TILE):
@@ -393,7 +395,7 @@ def q_proj_qr(
 
 @pl.jit.inline(auto_scope=False)
 def q_proj_q_matmul(
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     qr_i8_matmul: pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8],
     q_proj_i32: pl.Tensor[[QPROJ_MM_T_DYN, H * HEAD_DIM], pl.INT32],
     tile_rows: pl.Scalar[pl.INDEX],
@@ -405,6 +407,8 @@ def q_proj_q_matmul(
     with pl.spmd(
         QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
     ) as qproj_tid:
+        # Weight reads bypass L2.
+        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         qproj_worker = pl.tile.get_block_idx()
         for qproj_n_idx in pl.range(
             qproj_worker, (H * HEAD_DIM) // QPROJ_MM_N_TILE, QPROJ_WORKERS,
@@ -601,7 +605,7 @@ def q_proj_q_dequant(
 @pl.jit.inline(auto_scope=False)
 def q_proj_q(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
@@ -631,8 +635,8 @@ def q_proj_q(
 @pl.jit.inline(auto_scope=False)
 def q_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
@@ -664,8 +668,6 @@ def q_proj_rope(
                 x_tile, wq_b, wq_b_scale, cos_tile, sin_tile, swap_tile, q_tile,
                 qr_i8_matmul, qr_scale_pad_store, q_seq_dep,
             )
-
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -702,6 +704,8 @@ def kv_proj_rope(
             with pl.spmd(
                 (HEAD_DIM // KV_N_TILE) * KV_OK * kv_m_groups, name_hint="kv_proj_matmul", deps=[late_dep],
             ) as _kv_tid:
+                # Weight reads bypass L2.
+                pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
                 kbg = pl.tile.get_block_idx()
                 kv_col0 = (kbg // (KV_OK * kv_m_groups)) * KV_N_TILE
                 kv_k_base = ((kbg // kv_m_groups) % KV_OK) * KV_SPLIT_K_TILE
@@ -890,8 +894,8 @@ def kv_proj_rope(
 @pl.jit.inline(auto_scope=False)
 def qkv_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -939,8 +943,8 @@ def qkv_proj_rope(
 @pl.jit
 def qkv_proj_rope_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -990,8 +994,8 @@ SPLIT_T_LOCAL = SPLIT_T_FULL // 4
 def q_kv_split_test(
     x_local: pl.Tensor[[SPLIT_T_LOCAL, D], pl.BF16],
     x_full: pl.Tensor[[SPLIT_T_FULL, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos_local: pl.Tensor[[SPLIT_T_LOCAL, ROPE_DIM], pl.BF16],
@@ -1106,11 +1110,11 @@ def build_split_tensor_specs():
 def golden_qkv_proj_rope(tensors):
     """Torch reference: Q/KV LoRA + RoPE for an already attention-normalized input."""
     import torch
-    from utils import int8_quant_per_row
+    from utils import int8_quant_per_row, unpack_nz
 
     x = tensors["x"].float()
-    wq_a = tensors["wq_a"].float()
-    wq_b = tensors["wq_b"]
+    wq_a = unpack_nz(tensors["wq_a"]).float()
+    wq_b = unpack_nz(tensors["wq_b"])
     wq_b_scale = tensors["wq_b_scale"].float().view(-1)
     wkv = tensors["wkv"].float()
     rope_cos = tensors["rope_cos"].float()
@@ -1172,6 +1176,7 @@ def golden_qkv_proj_rope(tensors):
 def build_tensor_specs(B, S):
     import torch
     from golden import TensorSpec
+    from utils import pack_nz
 
     T = B * S
 
@@ -1214,8 +1219,8 @@ def build_tensor_specs(B, S):
 
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: pack_nz(init_wq_a())),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: pack_nz(wq_b_i8)),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("rope_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
