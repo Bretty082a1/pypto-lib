@@ -38,13 +38,10 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. The entry stays
-# untagged until its routed-expert fixture matches the packed MxFp4 ABI: it still
-# imports `gen_routed_mx_weights`, which #1338 replaced with
-# `gen_routed_mxfp4_weights`, so `build_specs` raises ImportError before any device
-# work. Re-add `# ci: a5` together with the MxFp4 weight and golden update, and
-# give the file the `validate` / `test_precision` / `main` pair the A5 job expects.
+# A5-only; intentionally excluded from the A2/A3 device sweep. The complete-layer
+# entry exercises the packed MxFp4 routed-weight ABI and the TP-to-EP local-token path.
 # ci: no-sim
+# ci: a5
 
 import torch
 
@@ -121,6 +118,10 @@ from models.deepseek_v4_1_flash.prefill_c2a_full import (  # noqa: E402
     reference_attention,
 )
 from models.deepseek_v4_1_flash.prefill_c2a_reuse import prefill_c2a_reuse  # noqa: E402
+from models.deepseek_v4_1_flash.quantization import build_mxfp4_pair_lut  # noqa: E402
+from models.deepseek_v4_1_flash.rmsnorm import rms_norm as npu_rms_norm  # noqa: E402
+# Import moe before expert_routed: moe freezes C.RECV_MAX to this layer's token extent
+# before expert_routed captures the transport buffer shape in its annotations.
 from models.deepseek_v4_1_flash.moe import (  # noqa: E402
     AUX_WIDTH,
     EP_SIZE,
@@ -130,6 +131,14 @@ from models.deepseek_v4_1_flash.moe import (  # noqa: E402
     ROUTE_WIDTH,
     _golden_moe_core as golden_moe_core,
     _moe_core as moe_core,
+)
+from models.deepseek_v4_1_flash.expert_routed import (  # noqa: E402
+    MX_PACKED_LANE_COLS,
+    MX_W1_PACKED_ROWS,
+    MX_W2_PACKED_ROWS,
+    MX_W3_PACKED_ROWS,
+    ROUTED_DEQUANT_STD,
+    gen_routed_mxfp4_weights,
 )
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run  # noqa: E402
@@ -168,7 +177,8 @@ def moe_hc_pre(
 ):
     """Derive the FFN sublayer's mixes, then collapse with the attention sublayer's pre-mix.
 
-    The MoE gate applies ``ffn_norm`` itself, so the collapsed stream enters it unnormalized.
+    The collapsed stream stays in BF16 here; ``prefill_moe_sublayer`` applies RMSNorm
+    immediately before the packed MoE core consumes it.
     """
     mhc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
     mhc_pre(x_hc, pre_mix, ffn_input)
@@ -190,6 +200,55 @@ def widen_to_fp32(
     return output
 
 
+@pl.jit.inline
+def _local_token_count(num_tokens: pl.Scalar[pl.INT32], tp_rank: pl.Scalar[pl.INT32]):
+    """Map the replicated TP token prefix to this rank's compact local prefix."""
+    # The runtime validates 1 <= num_tokens <= TOKENS and tp_rank is a valid TP lane,
+    # so the integer ceiling is already in [0, TOKENS].  Keep the native INDEX scalar
+    # type produced by the division for comparisons and row addressing.
+    return (num_tokens + TP_SIZE - 1 - tp_rank) // TP_SIZE
+
+
+@pl.jit.inline
+def _compact_local_tokens(
+    source: pl.Tensor[[T_DYN, D], pl.BF16],
+    compact: pl.Tensor[[T_DYN, D], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+):
+    """Pack this TP rank's interleaved owner rows into the local-token ABI prefix."""
+    tokens = pl.tensor.dim(source, 0)
+    local_tokens = _local_token_count(num_tokens, tp_rank)
+    for row in pl.spmd(tokens, name_hint="prefill_moe_compact"):
+        value = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+        if row < local_tokens:
+            source_row = row * TP_SIZE + tp_rank
+            value = pl.tile.load(source, [source_row, 0], [1, D])
+        pl.tile.store(value, [row, 0], compact, shapes=[1, D])
+    return compact
+
+
+@pl.jit.inline
+def _scatter_local_tokens(
+    compact: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+):
+    """Scatter compact local MoE rows back into the original TP token positions."""
+    tokens = pl.tensor.dim(output, 0)
+    local_tokens = _local_token_count(num_tokens, tp_rank)
+    for row in pl.spmd(tokens, name_hint="prefill_moe_scatter_zero"):
+        zero = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+        pl.tile.store(zero, [row, 0], output, shapes=[1, D])
+    for row in pl.spmd(tokens, name_hint="prefill_moe_scatter"):
+        if row < local_tokens:
+            dst_row = row * TP_SIZE + tp_rank
+            value = pl.tile.load(compact, [row, 0], [1, D])
+            pl.tile.store(value, [dst_row, 0], output, shapes=[1, D])
+    return output
+
+
 @pl.jit.inline(auto_scope=False)
 def prefill_moe_sublayer(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -200,19 +259,19 @@ def prefill_moe_sublayer(
     ffn_norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    token_owners: pl.Tensor[[T_DYN], pl.INT32],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -229,7 +288,6 @@ def prefill_moe_sublayer(
     residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
@@ -244,16 +302,25 @@ def prefill_moe_sublayer(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         next_pre_mix, post_mix, residual_mix, ffn_input,
     )
-    # Keep the transport windows and routed result alive through combine, as moe.py does.
+    # The current EP ABI consumes one compact local-token prefix per rank.  The
+    # prefill residual stream still stores rows in the replicated TP layout, so
+    # compact this rank's interleaved owner rows before MoE and scatter them back.
+    local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
+    local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
+    local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
+    _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
+    npu_rms_norm(local_ffn_input, ffn_norm_weight, local_ffn_normed)
+    local_num_tokens = _local_token_count(num_tokens, tp_rank)
     with pl.scope():
         moe_core(
-            ffn_input, ffn_norm_weight, gate_weight, correction_bias,
+            local_ffn_normed, gate_weight, correction_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-            shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
-            token_owners, recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-            arrived, data_arrived, routed_output, combine_arrived, ffn_owned,
-            num_tokens, ep_rank, group_base, tp_rank, moe_epoch,
+            mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
+            shared_w3, shared_w3_scale, recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            arrived, data_arrived, routed_output, combine_arrived, local_ffn_owned,
+            local_num_tokens, ep_rank, moe_epoch,
         )
+        _scatter_local_tokens(local_ffn_owned, ffn_owned, num_tokens, tp_rank)
     return ffn_owned
 
 
@@ -302,6 +369,7 @@ MOE_SHARED_NAMES = (
 )
 MOE_RANK_NAMES = (
     "routed_w1", "routed_w1_scale", "routed_w2", "routed_w2_scale", "routed_w3", "routed_w3_scale",
+    "mxfp4_pair_lut",
 )
 MOE_REPLICATED_NAMES = MOE_GATE_NAMES + MOE_SHARED_NAMES
 
@@ -347,15 +415,14 @@ def make_moe_replicated_inputs(seed):
 @functools.lru_cache(maxsize=None)
 def make_moe_rank_inputs(rank):
     """This rank's routed-expert shard, drawn through the checkpoint conversion path."""
-    from models.deepseek_v4_1_flash.expert_routed import ROUTED_DEQUANT_STD, gen_routed_mx_weights
-
-    w1, w1_scale, w3, w3_scale, w2, w2_scale = gen_routed_mx_weights(
+    w1, w1_scale, w3, w3_scale, w2, w2_scale = gen_routed_mxfp4_weights(
         N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3
     )
     return {
         "routed_w1": w1, "routed_w1_scale": w1_scale,
         "routed_w2": w2, "routed_w2_scale": w2_scale,
         "routed_w3": w3, "routed_w3_scale": w3_scale,
+        "mxfp4_pair_lut": build_mxfp4_pair_lut(),
     }
 
 
@@ -410,18 +477,34 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
 
 
 def golden_moe_rows(tensors, ffn_input, tokens):
-    """Run the EP MoE reference over the world; every rank keeps only the rows it owns."""
+    """Run the EP MoE on each rank's compact local-token prefix, then scatter owners back."""
+    world = ffn_input.shape[0]
+    counts = torch.zeros(world, dtype=torch.int32)
+    local_input = torch.zeros_like(ffn_input)
+    for rank in range(world):
+        tp_rank = rank % TP_SIZE
+        count = max(0, min(tokens, (tokens + TP_SIZE - 1 - tp_rank) // TP_SIZE))
+        counts[rank] = count
+        if count:
+            source_rows = torch.arange(count, dtype=torch.long) * TP_SIZE + tp_rank
+            local_input[rank, :count] = ffn_input[rank, source_rows]
     moe_tensors = {
-        "x": ffn_input,
+        "x": local_input,
         "norm_weight": tensors["ffn_norm_weight"],
-        "token_owners": tensors["token_owners"],
-        "output": torch.zeros_like(ffn_input),
-        "num_tokens": tokens,
+        "mxfp4_pair_lut": tensors["mxfp4_pair_lut"],
+        "output": torch.zeros_like(local_input),
+        "num_tokens": counts,
     }
     for name in MOE_REPLICATED_NAMES + MOE_RANK_NAMES:
         moe_tensors[name] = tensors[name]
     golden_moe_core(moe_tensors)
-    return moe_tensors["output"]
+    scattered = torch.zeros_like(ffn_input)
+    for rank in range(world):
+        count = int(counts[rank])
+        if count:
+            destination_rows = torch.arange(count, dtype=torch.long) * TP_SIZE + (rank % TP_SIZE)
+            scattered[rank, destination_rows] = moe_tensors["output"][rank, :count]
+    return scattered
 
 
 def make_layer_golden(mode):
@@ -748,19 +831,19 @@ def make_layer_program(capacity, world_size):
         ffn_norm_weight: pl.Tensor[[D], pl.BF16],
         gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
         correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-        routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+        routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
         routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-        routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.FP8E4M3FN],
+        routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
         routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
-        routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+        routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
         routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+        mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
         shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
         shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
         shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
         shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
         shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
         shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-        token_owners: pl.Tensor[[TOKENS], pl.INT32],
         ffn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
         ffn_owned: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
         next_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
@@ -784,11 +867,11 @@ def make_layer_program(capacity, world_size):
             x_hc_mid, attn_pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
             ffn_norm_weight, gate_weight, correction_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-            shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
-            token_owners, recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
+            shared_w3, shared_w3_scale, recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             arrived, data_arrived, routed_output, combine_arrived,
             ffn_input, ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix,
-            num_tokens, rank, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, moe_epoch,
+            num_tokens, rank, rank % TP_SIZE, moe_epoch,
         )
         return ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix, ffn_input
 
@@ -851,12 +934,13 @@ def make_layer_program(capacity, world_size):
         ffn_norm_weight: pl.Tensor[[world_size, D], pl.BF16],
         gate_weight: pl.Tensor[[world_size, N_EXPERTS, D], pl.FP32],
         correction_bias: pl.Tensor[[world_size, N_EXPERTS], pl.FP32],
-        routed_w1: pl.Tensor[[world_size, N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+        routed_w1: pl.Tensor[[world_size, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
         routed_w1_scale: pl.Tensor[[world_size, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-        routed_w2: pl.Tensor[[world_size, N_LOCAL_EXPERTS, MOE_INTER, D], pl.FP8E4M3FN],
+        routed_w2: pl.Tensor[[world_size, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
         routed_w2_scale: pl.Tensor[[world_size, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-        routed_w3: pl.Tensor[[world_size, N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+        routed_w3: pl.Tensor[[world_size, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
         routed_w3_scale: pl.Tensor[[world_size, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+        mxfp4_pair_lut: pl.Tensor[[world_size, 2, 256], pl.INT16],
         shared_w1: pl.Tensor[[world_size, D, MOE_INTER], pl.FP8E4M3FN],
         shared_w1_scale: pl.Tensor[[world_size, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
         shared_w2: pl.Tensor[[world_size, MOE_INTER, D], pl.FP8E4M3FN],
@@ -938,9 +1022,9 @@ def make_layer_program(capacity, world_size):
                 x_hc_mid[rank], attn_pre_mix[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
                 ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank],
                 routed_w1[rank], routed_w1_scale_r, routed_w2[rank], routed_w2_scale_r,
-                routed_w3[rank], routed_w3_scale_r,
+                routed_w3[rank], routed_w3_scale_r, mxfp4_pair_lut[rank],
                 shared_w1[rank], shared_w1_scale_r, shared_w2[rank], shared_w2_scale_r,
-                shared_w3[rank], shared_w3_scale_r, token_owners[rank],
+                shared_w3[rank], shared_w3_scale_r,
                 ffn_input[rank], ffn_owned[rank], next_pre_mix[rank], ffn_post_mix[rank],
                 ffn_residual_mix[rank],
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
@@ -1049,7 +1133,7 @@ def build_specs(args, mode, initial_state):
     return specs
 
 
-def run_prefill_layer(make_program, mode):
+def run_prefill_layer(make_program, mode, argv=None):
     """Validate one complete prefill layer on A5; ``make_program`` builds the L3 entry."""
     from pypto.ir import DistributedConfig
 
@@ -1071,7 +1155,7 @@ def run_prefill_layer(make_program, mode):
     parser.add_argument("--case", default="mixed", choices=["mixed", "long", "masked", "zero"])
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # config and the MoE shapes were frozen from the same command line before argparse ran.
     if (args.tp, args.dp, args.ep, args.tokens) != (TP_SIZE, C.DP_SIZE, EP_SIZE, C.MOE_TOKENS):
@@ -1106,17 +1190,21 @@ def run_prefill_layer(make_program, mode):
         compare_fn=make_layer_compare(mode, args.tokens, initial_state),
     )
     print(f"[LAYER] work_dir={result.work_dir}")
-    if args.compile_only:
+    if args.compile_only and result.passed:
         print("[LAYER] Compilation passed; device accuracy was NOT validated.")
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    return result
+
+
+def validate(argv=None):
+    """Validate the complete packed prefill layer against its golden reference on A5."""
+    return run_prefill_layer(make_layer_program, "reuse", argv=argv)
 
 
 def main():
     """Validate one complete prefill layer, C2A Reuse attention followed by the EP MoE."""
-    run_prefill_layer(make_layer_program, "reuse")
+    result = validate()
+    if not result.passed:
+        raise SystemExit(result.error or 1)
 
 
 __all__ = [
@@ -1124,8 +1212,19 @@ __all__ = [
     "prefill_ffn_restore",
     "prefill_moe_sublayer",
     "run_prefill_layer",
+    "validate",
     "widen_to_fp32",
 ]
+
+
+if "pytest" in sys.modules:
+    import pytest
+
+    @pytest.mark.parametrize("tp,dp", [(1, 2), (2, 2)])
+    def test_precision(tp, dp, a5_args):
+        """Validate TP1/DP2 and TP2/DP2 complete prefill layer cases on A5."""
+        result = validate(a5_args(tp=tp, dp=dp))
+        assert result.passed, result.error
 
 
 # A2/A3 CI currently discovers runnable model files by the conventional entry
