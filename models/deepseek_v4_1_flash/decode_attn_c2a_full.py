@@ -12,6 +12,7 @@ import argparse
 import math
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -93,7 +94,6 @@ SPARSE_WIDTH = WINDOW + INDEX_TOPK
 ATTEND_TILE = 64
 SPARSE_PARTS = SPARSE_WIDTH // ATTEND_TILE
 QUERY_TILE = 32
-GATHER_WORKERS = 8
 
 # Indexer selection. Candidates are scored one leaf at a time and folded into a
 # running Top-K, which keeps the sort width independent of the context length.
@@ -458,13 +458,10 @@ def index_select(
                         low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
                         low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
                         low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                        # unsupported integer cast on the exponent-assembly path.
-                        low_pow2 = pl.div(
-                            pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
-                                          pl.mul(low_exponent, 5.0)), 6.0),
-                            6.0,
-                        )
+                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
+                        low_exponent_i32 = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.INT32)
+                        low_exponent_bits = pl.shls(pl.add(low_exponent_i32, 127), 23)
+                        low_pow2 = pl.reinterpret_view(low_exponent_bits, pl.FP32)
                         low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
                         low_is_normal = pl.minimum(low_exponent, 1.0)
                         low_magnitude = pl.add(
@@ -475,13 +472,10 @@ def index_select(
                         high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
                         high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
                         high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                        # unsupported integer cast on the exponent-assembly path.
-                        high_pow2 = pl.div(
-                            pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
-                                          pl.mul(high_exponent, 5.0)), 6.0),
-                            6.0,
-                        )
+                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
+                        high_exponent_i32 = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.INT32)
+                        high_exponent_bits = pl.shls(pl.add(high_exponent_i32, 127), 23)
+                        high_pow2 = pl.reinterpret_view(high_exponent_bits, pl.FP32)
                         high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
                         high_is_normal = pl.minimum(high_exponent, 1.0)
                         high_magnitude = pl.add(
@@ -559,6 +553,206 @@ def index_select(
     return select_tid
 
 
+_GATHER_NATIVE_CPP = r'''
+// A5 conversion and gather2 techniques follow DeepSeek FlashMLA.
+#include <cstdint>
+#include "tensor.h"
+#include "intrinsic.h"
+#include "kernel_operator.h"
+#include "c_api/asc_simd.h"
+
+#if __has_include("tensormap_and_ringbuffer/tensor.h")
+using RuntimeTensor = Tensor;
+#elif __has_include("task_interface/buffer.h")
+using RuntimeTensor = ChipTensor;
+#else
+using RuntimeTensor = Tensor;
+#endif
+static_assert(sizeof(RuntimeTensor) == 128);
+
+template<class T>
+__aicore__ inline __gm__ T* data(__gm__ int64_t* args, int i) {
+    auto t = reinterpret_cast<__gm__ RuntimeTensor*>(args[i]);
+    return reinterpret_cast<__gm__ T*>(t->buffer.addr) + t->start_offset;
+}
+
+// Raw rows and output stay in UB; FP4 is converted by A5 hardware rather than
+// reconstructed with a long chain of casts, shifts and polynomial arithmetic.
+__simd_callee__ inline void decode4(__ubuf__ uint8_t* raw, __ubuf__ uint8_t* scale_raw,
+                        __ubuf__ bfloat16_t* scale_tmp, __ubuf__ bfloat16_t* out) {
+    auto mask = asc_create_mask_b16(PAT_ALL);
+    vector_uint16_t idx;
+    asc_arange((vector_int16_t&)idx, int16_t(0));
+    vector_fp8_e4m3fn_t packed_scales;
+    asc_gather((vector_uint16_t&)packed_scales, scale_raw, idx, mask);
+    vector_float even, odd;
+    asc_e4m32float(even, packed_scales, mask, ASC_DISPERSE_FIRST_QUARTER);
+    asc_e4m32float(odd, packed_scales, mask, ASC_DISPERSE_THIRD_QUARTER);
+    vector_uint32_t bits;
+    vector_bfloat16_t scales;
+    asc_shiftright_scalar(bits, (vector_uint32_t&)even, 16, mask);
+    asc_or((vector_uint32_t&)scales, bits, (vector_uint32_t&)odd, mask);
+    asc_storealign(scale_tmp, scales, mask);
+    asc_mem_bar(VST_VLD);
+    auto sp = scale_tmp;
+    auto rp = reinterpret_cast<__ubuf__ fp4x2_e2m1_t*>(raw);
+    for (uint16_t chunk=0; chunk<4; ++chunk) {
+        vector_bfloat16_t scale, value;
+        vector_fp4x2_e2m1_t packed;
+        asc_loadalign_brc_elem2datablock_postupdate(scale, sp, 8);
+        asc_loadalign_unpack4_postupdate(packed, rp, 64);
+        asc_e2m1x22bfloat16(value, packed, mask, ASC_DISPERSE_FIRST_QUARTER);
+        asc_mul(value, value, scale, mask);
+        asc_storealign(out + chunk*128, value, mask);
+    }
+}
+
+__simd_callee__ inline void decode8(__ubuf__ uint8_t* raw, __ubuf__ uint8_t* scale_raw,
+                        __ubuf__ bfloat16_t* scale_tmp, __ubuf__ bfloat16_t* out) {
+    auto mask = asc_create_mask_b16(PAT_ALL);
+    vector_uint16_t idx, codes;
+    asc_arange((vector_int16_t&)idx, int16_t(0));
+    // Each of 16 scales is repeated eight times before the 16->32 broadcast.
+    asc_shiftright_scalar(idx, idx, 3, mask);
+    asc_gather(codes, scale_raw, idx, mask);
+    asc_shiftleft_scalar(codes, codes, 7, mask);
+    asc_max_scalar(codes, codes, uint16_t(64), mask);
+    asc_storealign((__ubuf__ uint16_t*)scale_tmp, codes, mask);
+    asc_mem_bar(VST_VLD);
+    auto rp = reinterpret_cast<__ubuf__ fp8_e4m3fn_t*>(raw);
+    for (uint16_t chunk=0; chunk<4; ++chunk) {
+        vector_fp8_e4m3fn_t packed;
+        vector_float even, odd;
+        vector_uint32_t bits;
+        vector_bfloat16_t value, scale;
+        asc_loadalign_unpack_postupdate(packed, rp, 128);
+        asc_e4m32float(even, packed, mask);
+        asc_e4m32float_v3(odd, packed, mask);
+        asc_shiftright_scalar(bits, (vector_uint32_t&)even, 16, mask);
+        asc_or((vector_uint32_t&)value, bits, (vector_uint32_t&)odd, mask);
+
+        // Broadcast each UE8M0 factor over its 32 payload values.
+        vector_uint16_t si;
+        asc_arange((vector_int16_t&)si, int16_t(0));
+        asc_shiftright_scalar(si, si, 5, mask);
+        asc_mul_scalar(si, si, 8, mask);
+        asc_gather((vector_uint16_t&)scale, (__ubuf__ uint16_t*)(scale_tmp+chunk*32), si, mask);
+        asc_mul(value, value, scale, mask);
+        asc_storealign(out + chunk*128, value, mask);
+    }
+}
+
+__simd_callee__ inline void zeros(__ubuf__ bfloat16_t* out) {
+    auto mask=asc_create_mask_b16(PAT_ALL);
+    vector_bfloat16_t v;
+    asc_duplicate_scalar(v, bfloat16_t(0.0f), mask);
+    for(uint16_t j=0;j<4;++j) asc_storealign(out+j*128,v,mask);
+}
+
+
+__simd_vf__ void decode_batch(__ubuf__ uint8_t* raw, __ubuf__ uint8_t* scales,
+    __ubuf__ bfloat16_t* tmp, __ubuf__ bfloat16_t* result,
+    uint32_t valid, uint16_t count, uint16_t phase) {
+    for(uint16_t row=0;row<count;++row) {
+        if((valid & (1u<<row))==0) zeros(result+row*512);
+        else if(phase==0) decode8(raw+row*512,scales+row*32,tmp,result+row*512);
+        else decode4(raw+row*512,scales+row*32,tmp,result+row*512);
+    }
+}
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+#if defined(__DAV_VEC__)
+    set_atomic_none();
+    auto out=data<bfloat16_t>(args,0);
+    auto wc=data<uint8_t>(args,1), ws=data<uint8_t>(args,2);
+    auto wi=data<int32_t>(args,3);
+    auto cc=data<uint8_t>(args,4), cs=data<uint8_t>(args,5);
+    auto ci=data<int32_t>(args,6);
+    int32_t start=args[7], workers=args[8], block=get_block_idx(args);
+    int32_t local=block/workers, lane=block%workers, token=start+local;
+    auto raw=reinterpret_cast<__ubuf__ uint8_t*>(0);
+    auto scales=reinterpret_cast<__ubuf__ uint8_t*>(16384);
+    auto tmp=reinterpret_cast<__ubuf__ bfloat16_t*>(17408);
+    auto result=reinterpret_cast<__ubuf__ bfloat16_t*>(17664);
+    auto indices=reinterpret_cast<__ubuf__ int32_t*>(50432);
+    for(int phase=0;phase<2;++phase) {
+        int width=phase==0?128:512, count=width/workers;
+        int bytes=phase==0?512:256, nscale=phase==0?16:32;
+        auto cache=phase==0?wc:cc, scale_cache=phase==0?ws:cs;
+        asc_copy_gm2ub_align((__ubuf__ uint8_t*)indices,
+            (__gm__ uint8_t*)((phase==0?wi:ci)+token*width), width*4);
+        set_flag(PIPE_MTE2,PIPE_S,EVENT_ID0);wait_flag(PIPE_MTE2,PIPE_S,EVENT_ID0);
+        for(int base=lane*count;base<(lane+1)*count;base+=32) {
+            int n=count<32?count:32;
+            uint32_t valid=0;
+            for(int j=0;j<n;j+=2) {
+                int r0=indices[base+j], r1=indices[base+j+1];
+                if(r0>=0)valid|=1u<<j;
+                if(r1>=0)valid|=1u<<(j+1);
+                if(r0>=0 && r1>r0) {
+                    asc_copy_gm2ub_align(raw+j*512,cache+(int64_t)r0*bytes,2,bytes,0,0,false,
+                        asc_load_l2_cache_mode::NORMAL_LAST_VICTIM,(int64_t)(r1-r0)*bytes,512);
+                    asc_copy_gm2ub_align(scales+j*32,scale_cache+(int64_t)r0*nscale,2,nscale,0,0,false,
+                        asc_load_l2_cache_mode::NORMAL_LAST_VICTIM,(int64_t)(r1-r0)*nscale,32);
+                } else {
+                    if(r0>=0) {
+                        asc_copy_gm2ub_align(raw+j*512,cache+(int64_t)r0*bytes,bytes);
+                        asc_copy_gm2ub_align(scales+j*32,scale_cache+(int64_t)r0*nscale,nscale);
+                    }
+                    if(r1>=0) {
+                        asc_copy_gm2ub_align(raw+(j+1)*512,cache+(int64_t)r1*bytes,bytes);
+                        asc_copy_gm2ub_align(scales+(j+1)*32,scale_cache+(int64_t)r1*nscale,nscale);
+                    }
+                }
+            }
+            set_flag(PIPE_MTE2,PIPE_V,EVENT_ID0);wait_flag(PIPE_MTE2,PIPE_V,EVENT_ID0);
+            decode_batch(raw,scales,tmp,result,valid,n,phase);
+            set_flag(PIPE_V,PIPE_MTE3,EVENT_ID0);wait_flag(PIPE_V,PIPE_MTE3,EVENT_ID0);
+            asc_copy_ub2gm_align((__gm__ uint8_t*)(out+((int64_t)local*640+(phase==0?0:128)+base)*512),
+                                (__ubuf__ uint8_t*)result,n*1024);
+            pipe_barrier(PIPE_ALL);
+        }
+    }
+    pipe_barrier(PIPE_ALL);
+#endif
+}
+'''
+
+
+def _gather_native_source():
+    """Materialize the embedded CCE source as a generated compiler input."""
+    # PyPTO extern accepts a source path, so keep generated input outside the repo.
+    source_dir = Path(tempfile.mkdtemp(prefix="pypto_c2a_gather_"))
+    source = source_dir / "gather.cpp"
+    source.write_text(_GATHER_NATIVE_CPP, encoding="utf-8")
+    return source
+
+
+def _cann_include_dirs():
+    root = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
+    subdirs = (
+        "include", "asc", "asc/include", "asc/include/basic_api",
+        "asc/include/c_api", "asc/include/basic_api/reg_compute",
+        "asc/impl/basic_api", "asc/impl/c_api", "asc/impl/basic_api/reg_compute",
+        "asc/impl/utils",
+    )
+    dirs = tuple(base / sub for base in (root / f"{os.uname().machine}-linux", root)
+                 for sub in subdirs if (base / sub).is_dir())
+    if not dirs:
+        raise RuntimeError("CANN AscendC devkit headers are required for the A5 gather kernel")
+    return dirs
+
+
+@pl.jit.extern(core_type="aiv", source=_gather_native_source(),
+               include_dirs=_cann_include_dirs())
+def gather_native(
+    selected: pl.Out[pl.Tensor],
+    window_cache: pl.Tensor, window_scales: pl.Tensor, window_indices: pl.Tensor,
+    compressed_cache: pl.Tensor, compressed_scales: pl.Tensor, topk_indices: pl.Tensor,
+    chunk_start: pl.Scalar[pl.INT32], workers: pl.Scalar[pl.INT32],
+) -> pl.Tensor: ...
+
+
 @pl.jit.inline
 def gather_sparse(
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
@@ -569,115 +763,25 @@ def gather_sparse(
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     selected: pl.Tensor[[QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], pl.BF16],
     combined: pl.Tensor[[QUERY_TILE, SPARSE_WIDTH], pl.INT32],
-    chunk_start: pl.Scalar[pl.INT32],
-    active: pl.Scalar[pl.INT32],
+    chunk_start: pl.Scalar[pl.INT32], active: pl.Scalar[pl.INT32],
     chunk_done: pl.Scalar[pl.TASK_ID],
 ):
-    """Materialize one chunk's window and compressed KV rows in one dense buffer."""
-    window_rows = pl.tensor.dim(window_cache, 0) * 128
-    window_flat = pl.reshape(window_cache, [window_rows, HEAD_DIM])
-    window_scale_flat = pl.reshape(window_scales, [window_rows, HEAD_DIM // 32])
-    compressed_rows = pl.tensor.dim(compressed_cache, 0) * 128
-    compressed_flat = pl.reshape(compressed_cache, [compressed_rows, CMP_PACKED])
-    compressed_scale_flat = pl.reshape(compressed_scales, [compressed_rows, CMP_SCALES])
-    gathered = pl.reshape(selected, [QUERY_TILE * SPARSE_WIDTH, HEAD_DIM])
+    """Gather and dequantize sparse KV in batches using native A5 conversions."""
+    workers = 16
+    if active >= 16:
+        workers = 4
+    elif active >= 8:
+        workers = 8
     with pl.spmd(active, name_hint="c2a_sparse_plan", deps=[chunk_done]) as plan_tid:
         r = pl.tile.get_block_idx()
         t = chunk_start + r
-        combined[r : r + 1, 0:WINDOW] = window_indices[t : t + 1, :]
-        combined[r : r + 1, WINDOW:SPARSE_WIDTH] = topk_indices[t : t + 1, :]
-    with pl.spmd(active * GATHER_WORKERS, name_hint="c2a_window_gather", deps=[plan_tid]):
-        block = pl.tile.get_block_idx()
-        r = block // GATHER_WORKERS
-        t = chunk_start + r
-        for i in pl.range(block % GATHER_WORKERS * (WINDOW // GATHER_WORKERS),
-                          block % GATHER_WORKERS * (WINDOW // GATHER_WORKERS) + WINDOW // GATHER_WORKERS):
-            row_i32 = pl.read(window_indices, [t, i])
-            dst = r * SPARSE_WIDTH + i
-            if row_i32 >= 0:
-                row = pl.cast(row_i32, pl.INDEX)
-                value = pl.reshape(pl.cast(window_flat[row : row + 1, :], pl.FP32), [HEAD_DIM // 32, 32])
-                scale_row = pl.slice(
-                    window_scale_flat, [1, 32], [row, 0], valid_shape=[1, HEAD_DIM // 32]
-                )
-                raw_codes = pl.reinterpret_view(scale_row, pl.UINT8)
-                signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                codes = pl.ands(signed_codes, 255)
-                scale_values = pl.reinterpret_view(
-                    pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
-                )
-                scale = pl.reshape(scale_values[:, : HEAD_DIM // 32], [HEAD_DIM // 32, 1])
-                decoded = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
-                gathered[dst : dst + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
-            else:
-                gathered[dst : dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    with pl.spmd(active * GATHER_WORKERS, name_hint="c2a_compressed_gather", deps=[plan_tid]) as gather_tid:
-        block = pl.tile.get_block_idx()
-        r = block // GATHER_WORKERS
-        t = chunk_start + r
-        for i in pl.range(block % GATHER_WORKERS * (INDEX_TOPK // GATHER_WORKERS),
-                          block % GATHER_WORKERS * (INDEX_TOPK // GATHER_WORKERS)
-                          + INDEX_TOPK // GATHER_WORKERS):
-            row_i32 = pl.read(topk_indices, [t, i])
-            dst = r * SPARSE_WIDTH + WINDOW + i
-            if row_i32 >= 0:
-                row = pl.cast(row_i32, pl.INDEX)
-                packed = compressed_flat[row : row + 1, :]
-                wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
-                low = pl.ands(wide, 15)
-                high = pl.ands(pl.shrs(wide, 4), 15)
-                low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
-                low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
-                low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                # unsupported integer cast on the exponent-assembly path.
-                low_pow2 = pl.div(
-                    pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
-                                  pl.mul(low_exponent, 5.0)), 6.0),
-                    6.0,
-                )
-                low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
-                low_is_normal = pl.minimum(low_exponent, 1.0)
-                low_magnitude = pl.add(
-                    pl.mul(low_is_normal, low_normal),
-                    pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
-                )
-                low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
-                high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
-                high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
-                high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                # unsupported integer cast on the exponent-assembly path.
-                high_pow2 = pl.div(
-                    pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
-                                  pl.mul(high_exponent, 5.0)), 6.0),
-                    6.0,
-                )
-                high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
-                high_is_normal = pl.minimum(high_exponent, 1.0)
-                high_magnitude = pl.add(
-                    pl.mul(high_is_normal, high_normal),
-                    pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
-                )
-                high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
-                interleaved = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                interleaved = pl.tensor.scatter(
-                    low_value, mask_pattern=pl.tile.MaskPattern.P0101, dst=interleaved
-                )
-                interleaved = pl.tensor.scatter(
-                    high_value, mask_pattern=pl.tile.MaskPattern.P1010, dst=interleaved
-                )
-                factors = pl.cast(compressed_scale_flat[row : row + 1, :], pl.FP32)
-                scaled = pl.row_expand_mul(
-                    pl.reshape(interleaved, [CMP_SCALES, 16]), pl.reshape(factors, [CMP_SCALES, 1])
-                )
-                gathered[dst : dst + 1, :] = pl.reshape(
-                    pl.cast(scaled, pl.BF16, mode="rint"), [1, HEAD_DIM]
-                )
-            else:
-                gathered[dst : dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        combined[r:r+1, 0:WINDOW] = window_indices[t:t+1, :]
+        combined[r:r+1, WINDOW:SPARSE_WIDTH] = topk_indices[t:t+1, :]
+    with pl.spmd(active * workers, name_hint="c2a_native_gather", deps=[plan_tid]) as gather_tid:
+        gather_native(selected, window_cache, window_scales, window_indices,
+                                 compressed_cache, compressed_scales, topk_indices,
+                                 chunk_start, workers)
     return gather_tid
-
 
 def make_attend_sparse(*, vector_query=False):
     """Optionally route the query through Vector to guard A5 mixed-task startup."""
@@ -708,12 +812,14 @@ def make_attend_sparse(*, vector_query=False):
             maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
             denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
             numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            # Keep the query tile live across all sparse KV parts.  It is identical
+            # for the ten 64-row parts, so the mixed kernel can reuse one Cube tile.
+            q = query_flat[q0 : q0 + M_TILE, :]
+            if vector_query:
+                # An exact BF16 roundtrip requires Vector startup before the first score push.
+                q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
             for part in pl.range(SPARSE_PARTS):
                 k0 = r * SPARSE_WIDTH + part * ATTEND_TILE
-                q = query_flat[q0 : q0 + M_TILE, :]
-                if vector_query:
-                    # An exact BF16 roundtrip requires Vector startup before the first score push.
-                    q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
                 kv = key_flat[k0 : k0 + ATTEND_TILE, :]
                 scores = pl.mul(pl.matmul(q, kv, b_trans=True), SOFTMAX_SCALE)
                 idx = pl.cast(combined[r : r + 1, part * ATTEND_TILE : part * ATTEND_TILE + ATTEND_TILE], pl.FP32)
@@ -1201,7 +1307,9 @@ def official_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     window_slots = t["window_slots"].long()
     window_valid = window_slots >= 0
     window_rows = window_slots[window_valid]
-    _write_rows(window_cache, window_rows, window_payload[window_valid], head_dim)
+    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
+    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
+    _write_rows(window_cache, window_rows, visible_payload, head_dim)
     _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
 
     # c. Ratio-2 compressor: per-channel two-way softmax over the pair, pooled row rounded to
@@ -2069,6 +2177,7 @@ def run_c2a(operator, mode, argv=None, *, ring_heap=None):
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--runtime-dir", help="replay a compatible compiled build without recompiling")
     parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
@@ -2116,6 +2225,7 @@ def run_c2a(operator, mode, argv=None, *, ring_heap=None):
         fn=make_program(operator, capacity, len(devices), args.epochs),
         specs=build_specs(args, mode),
         golden_fn=make_golden(args.epochs),
+        runtime_dir=args.runtime_dir,
         compile_only=args.compile_only,
         save_data=args.save_data,
         golden_data=args.golden_data,

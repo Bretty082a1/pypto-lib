@@ -694,3 +694,157 @@ Local script execution is still supported with all original CLI options:
 task-submit --device auto --device-num 2 --run \
   'python models/deepseek_v4_1_flash/decode_attn_swa.py -p a5 --tp 1 --dp 2 -d $TASK_DEVICE'
 ```
+
+## C2A sparse attention optimization history
+
+Measured on 2026-10-09; recorded on 2026-10-10. Two rounds are retained:
+
+- Original baseline: `3902122`, the parent of the first optimization commit.
+- Round 1: `64d4a23205f95b7551b017b934f3ba34c45ad70e`
+  (the first sparse-attention optimization commit).
+- Round 2: the commit introducing this section and the embedded native gather
+  in `decode_attn_c2a_full.py`. Identify it with
+  `git log --oneline -- docs/models/deepseek_v4_1_flash/index.md`.
+
+### Measurement contract
+
+All full-attention comparisons use A5 devices 0,1,2,3, TP4/DP1, seed18,
+one epoch per dispatch, the existing conda `pypto` environment, PTOAS0.65,
+and CANN9.3.0. Every NPU run uses `task-submit`. Timing uses
+`PYPTO_BENCH=1`, 100 rounds and 5 warmup rounds. Timed device execution
+excludes compilation, CPU golden calculation and input generation.
+
+The tuning metric is the lowest per-rank median (`fastest`). The headline
+is the median of each round's maximum across ranks and includes rank start
+skew. Both are reported; fastest is not end-to-end step latency. Negative
+latency changes mean faster. These are recorded observations, not confidence
+intervals or guaranteed speedups across hardware and workloads.
+
+Inputs and golden outputs were captured once from the original baseline,
+then replayed for both rounds. The original-baseline validation used the same
+CPU Float8 compatibility correction as round1; that correction does not alter
+the device kernel. No successful case was rerun to select a better timing.
+
+### Round 1: DSL scheduling and decoding
+
+Changed `decode_attn_c2a_full.py` and `decode_attn_c2a_reuse.py`:
+
+1. Replace fixed eight gather workers per active query with sixteen for
+   fewer than eight queries, eight for eight through fifteen, and four for
+   sixteen or more. This adjusts the total AIV task count to active work.
+2. Combine window and compressed gather into one SPMD task region, replacing
+   separate regions and their dispatch/dependency overhead.
+3. Pipeline compressed row gathering with `pl.pipeline(..., stage=2)`.
+4. Replace polynomial calculation of FP4 exponent powers with exact FP32
+   exponent-bit construction in gather and index-key decoding.
+5. Fix CPU Float8 boolean indexing in both golden functions through an exact
+   FP32 roundtrip and expose `--runtime-dir` in the shared harness. These
+   changes support validation/replay and are not device speedups.
+
+Full C2A latency (microseconds):
+
+| Case / tokens / requests | Original fastest | Round1 fastest | Change | Original headline | Round1 headline | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| long / 24 / 6 | 3714.9 | 3610.9 | -2.80% | 4272.7 | 4136.9 | -3.18% |
+| long / 8 / 2 | 1659.5 | 1597.8 | -3.72% | 2430.5 | 2391.6 | -1.60% |
+| mixed / 24 / 6 | 3355.4 | 3291.0 | -1.92% | 4116.3 | 3968.8 | -3.58% |
+| masked / 24 / 6 | 3232.1 | 2954.7 | -8.58% | 3711.4 | 3679.4 | -0.86% |
+| zero / 24 / 6 | 3320.8 | 3257.3 | -1.91% | 4078.2 | 3956.2 | -2.99% |
+
+Reuse C2A latency (same contract):
+
+| Case / tokens / requests | Original fastest | Round1 fastest | Change | Original headline | Round1 headline | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| long / 24 / 6 | 2214.6 | 2042.7 | -7.76% | 2793.2 | 2698.1 | -3.40% |
+| mixed / 24 / 6 | 2064.9 | 1849.7 | -10.42% | 2591.1 | 2538.9 | -2.01% |
+
+### Round 2: batched native A5 gather
+
+Modify only `decode_attn_c2a_full.py` for the implementation. `_GATHER_NATIVE_CPP`
+contains the CCE source; `gather_native` declares the extern and `gather_sparse`
+dispatches it. Directly running the existing file selects this implementation.
+The C++ source is materialized in a generated system temporary directory because
+PyPTO extern requires a source file. No separate repository kernel source or
+Python wrapper is required.
+
+1. Stage indices into UB through MTE2 before scalar access to preserve coherency.
+2. Gather up to32 rows into UB per batch. For two forward distinct indices,
+   issue a two-row strided copy; repeated, reversed or invalid indices use
+   independent copies. Negative indices produce zero rows without cache reads.
+3. Use A5 native `asc_e2m1x22bfloat16` for FP4 and native FP8 conversion for
+   window values, replacing long software decoding chains. Preserve scale
+   broadcasting and the existing E8M0 floor semantics.
+4. Decode the batch in UB, then write its contiguous BF16 result through MTE3.
+   Synchronization happens per batch instead of per row. The workers retained
+   from round1 still determine how rows are divided among AIV tasks.
+
+The reference is [DeepSeek FlashMLA](https://github.com/deepseek-ai/FlashMLA/tree/2e5429fc5653bab6e081f09477126f731882a6a9),
+revision `2e5429fc5653bab6e081f09477126f731882a6a9`, Ascend sparse prefill
+`csrc/ascend_kernels/prefill/sparse/kernel_body.h`. Native conversion and paired
+row movement inform this implementation. It does not implement the reference's
+full fused attention framework: selected KV still materializes in GM, and
+QK/softmax/PV, cache ABI, Top-K selection and output projection retain their
+existing paths.
+
+Independent gather: A5 device0, 24 tokens, same frozen golden, 100/5 rounds,
+`effective_us` median **472.7 -> 114.1 us (-75.86%, 4.14x)**. This measures the
+gather subgraph including sparse-plan and task dispatch, not one instruction.
+It is a round1-to-round2 comparison. No original-baseline isolated gather number
+was captured. Strict active-output comparisons for tokens1/8/24 have zero
+mismatches for window rows, compressed rows and combined indices, including
+ascending/reversed/repeated/invalid index pairs.
+
+Full C2A latency (microseconds):
+
+| Case / tokens / requests | Round1 fastest | Round2 fastest | Change | Round1 headline | Round2 headline | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| long / 24 / 6 | 3610.9 | 3147.7 | -12.83% | 4136.9 | 3689.4 | -10.82% |
+| long / 8 / 2 | 1597.8 | 1478.7 | -7.45% | 2391.6 | 2184.3 | -8.67% |
+| mixed / 24 / 6 | 3291.0 | 3012.3 | -8.47% | 3968.8 | 3996.6 | +0.70% |
+| masked / 24 / 6 | 2954.7 | 3022.5 | +2.29% | 3679.4 | 3646.7 | -0.89% |
+| zero / 24 / 6 | 3257.3 | 3028.0 | -7.04% | 3956.2 | 3755.1 | -5.08% |
+
+Masked fastest latency regresses2.29%; mixed headline regresses0.70%.
+These observations remain part of the retained result. Round2 reuse figures from
+an earlier external candidate are historical experiments and must not be cited
+as measurements of the integrated source; integrated reuse was not remeasured.
+All five integrated full cases pass output, Top-K and cache comparisons.
+Output relative-L2 remains0.00742195 (long24),0.00928875 (long8),0.0031289 (mixed),
+and0 (masked/zero). The full output is not claimed to equal the FP32 golden
+bit-for-bit; the isolated gather equality check is stricter.
+
+### Evidence and reproduction
+
+Local evidence is retained outside the checkout in sibling directories:
+
+- `c2a_tuning_20261009`: round1 candidate sweep, rejected variants and logs.
+- `c2a_baselines_20261009`: original/round1 tables, `experiments.csv`,
+  `validation_matrix.json`, original frozen-data/build references and logs.
+- `c2a_stage1_20261009`: `results_integrated.json`, `experiments.csv`,
+  `validation_matrix.json`, `integrated_*.log`, strict gather logs and archived
+  external candidates. `REPORT_zh.md` distinguishes historical and integrated
+  measurements. Archived sources are evidence, not production entry points.
+
+Integrated task IDs: `task_20261009_191702_129754421291` (long24/long8),
+`task_20261009_191752_131223513449` (strict gather and isolated timing), and
+`task_20261009_191841_1320619695` (mixed/masked/zero). Mixed first compilation
+failed in an unchanged attention task with empty PTOAS diagnostics. The failed
+log is preserved; only failed/unrun cases were retried with codegen concurrency1
+and passed, without a source workaround or toolchain change.
+
+After activating `pypto` and the matching CANN environment, set `PYTHONPATH`
+to the checkout and `PTOAS_ROOT` to the matching toolchain. For a fresh,
+explicitly requested reproduction with a compatible frozen golden:
+
+```bash
+export PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=100 PYPTO_BENCH_WARMUP=5
+export PYPTO_CODEGEN_MAX_WORKERS=1
+task-submit --device 0,1,2,3 --env PYTHONPATH --env PTOAS_ROOT \
+  --env PYPTO_BENCH --env PYPTO_BENCH_ROUNDS --env PYPTO_BENCH_WARMUP \
+  --env PYPTO_CODEGEN_MAX_WORKERS --env GOLDEN_DATA --run \
+  'python models/deepseek_v4_1_flash/decode_attn_c2a_full.py -p a5 --device "$TASK_DEVICE" --tp 4 --dp 1 --tokens 24 --requests 6 --case long --seed 18 --golden-data "$GOLDEN_DATA"'
+```
+
+Set and pass `GOLDEN_DATA` with `--env GOLDEN_DATA` for the captured case.
+Use an independently captured golden for another shape/case. Source changes
+require a fresh compilation; do not replay a round1 runtime directory as round2.
